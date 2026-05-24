@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 # Add shadow-code to path
-ROOT = Path("/home/evilnull/Documents/projects/shadow-code")
+ROOT = Path("/home/null0xxx/Documents/projects/shadow-code")
 sys.path.insert(0, str(ROOT))
 
 import requests
@@ -30,13 +30,13 @@ TESTS = [
     # POSITIVE: must produce a valid tool_call
     {"prompt": "List the files in /tmp", "expect": "tool", "tool": "bash"},
     {"prompt": "Read /etc/hostname for me", "expect": "tool", "tool": "read_file"},
-    {"prompt": "Find all Python files in /home/evilnull/Documents/projects/shadow-code", "expect": "tool", "tool": "glob"},
-    {"prompt": "Search for the string 'def main' in *.py files in /home/evilnull/Documents/projects/shadow-code", "expect": "tool", "tool": "grep"},
-    {"prompt": "Show me what's in /home/evilnull/Documents/projects/shadow-code", "expect": "tool", "tool": "list_dir"},
+    {"prompt": "Find all Python files in /home/null0xxx/Documents/projects/shadow-code", "expect": "tool", "tool": "glob"},
+    {"prompt": "Search for the string 'def main' in *.py files in /home/null0xxx/Documents/projects/shadow-code", "expect": "tool", "tool": "grep"},
+    {"prompt": "Show me what's in /home/null0xxx/Documents/projects/shadow-code", "expect": "tool", "tool": "list_dir"},
     {"prompt": "Run the command 'date' and tell me the output", "expect": "tool", "tool": "bash"},
-    {"prompt": "Read /home/evilnull/Documents/projects/shadow-code/README.md", "expect": "tool", "tool": "read_file"},
-    {"prompt": "Find all *.toml files in the current project at /home/evilnull/Documents/projects/shadow-code", "expect": "tool", "tool": "glob"},
-    {"prompt": "List files in /home/evilnull/Documents/projects/shadow-code/shadow_code", "expect": "tool", "tool": "list_dir"},
+    {"prompt": "Read /home/null0xxx/Documents/projects/shadow-code/README.md", "expect": "tool", "tool": "read_file"},
+    {"prompt": "Find all *.toml files in the current project at /home/null0xxx/Documents/projects/shadow-code", "expect": "tool", "tool": "glob"},
+    {"prompt": "List files in /home/null0xxx/Documents/projects/shadow-code/shadow_code", "expect": "tool", "tool": "list_dir"},
     {"prompt": "Use bash to print 'hello world'", "expect": "tool", "tool": "bash"},
     # NEGATIVE: must NOT produce a tool_call (just answer)
     {"prompt": "What is 2+2?", "expect": "no_tool"},

@@ -5,7 +5,7 @@
 
 This variant pairs the local `qwen2.5-coder:7b` model with shadow-code's
 agentic loop and selectively imports rules + skills from
-[`elite-agent-system`](https://github.com/Evil-Null/elite-agent-system) at
+[`elite-agent-system`](https://github.com/null0xxx/elite-agent-system) at
 `~/.copilot/`.
 
 ## What you get

@@ -973,7 +973,7 @@ def clear_old_tool_results(messages: list[dict]) -> list[dict]:
 
 ## 7. Phase 3: Polish (deepseek-chat UI patterns reused)
 
-Source: github.com/Evil-Null/deepseek-chat -- same author's Python CLI with Rich UI.
+Source: github.com/null0xxx/deepseek-chat -- same author's Python CLI with Rich UI.
 We reuse its proven UI architecture but add tool calling display.
 
 ### 7.1 ui.py -- UIRenderer (from deepseek-chat)
