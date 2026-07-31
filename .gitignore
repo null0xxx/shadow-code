@@ -7,6 +7,7 @@ dist/
 build/
 *.egg
 .venv/
+.worktrees/
 .env
 *.db
 ~/.shadow-code/
