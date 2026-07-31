@@ -28,7 +28,7 @@ from .config import (
 from .conversation import Conversation
 from .display import StreamDisplay
 from .ollama_client import OllamaClient
-from .parser import ToolCall, parse_legacy_markdown_tool_calls
+from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
 from .prompt import SYSTEM_PROMPT
 from .safety import check_destructive
 from .skills import get_skill, list_skills
@@ -62,7 +62,7 @@ except ImportError:
 
 def _get_legacy_markdown_tool_calls(
     response: str, *, enabled: bool = LEGACY_MARKDOWN_TOOLS
-) -> list[ToolCall]:
+) -> list[LegacyMarkdownToolCall]:
     """Parse legacy Markdown tool calls only after explicit runtime opt-in."""
     if not enabled:
         return []

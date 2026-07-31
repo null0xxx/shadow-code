@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class ToolCall:
+class LegacyMarkdownToolCall:
     tool: str
     params: dict
     raw: str
@@ -39,20 +39,20 @@ def _try_parse_tool_json(json_str: str) -> dict | None:
     return None
 
 
-def parse_legacy_markdown_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+def parse_legacy_markdown_tool_calls(text: str) -> tuple[str, list[LegacyMarkdownToolCall]]:
     """Extract explicitly labelled legacy tool calls from model response.
 
     Returns (clean_text, calls) where clean_text has tool call blocks removed
-    and calls is a list of parsed ToolCall objects.
+    and calls is a list of parsed LegacyMarkdownToolCall objects.
 
     Plain Markdown code fences, including ``bash`` and ``sh``, are never tool
     calls. This parser is retained only for explicit compatibility with old
     ``tool_call`` responses and must be gated at the production boundary.
 
-    Invalid JSON inside a canonical ```tool_call``` produces a ToolCall with
+    Invalid JSON inside a canonical ```tool_call``` produces a LegacyMarkdownToolCall with
     tool="__invalid__" so the caller can report the error back to the model.
     """
-    calls: list[ToolCall] = []
+    calls: list[LegacyMarkdownToolCall] = []
     consumed_spans: list[tuple[int, int]] = []
 
     # Closed canonical fences are strict: invalid JSON is reported to the model.
@@ -61,7 +61,9 @@ def parse_legacy_markdown_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
         json_str = match.group(1)
         data = _try_parse_tool_json(json_str)
         if data is not None:
-            calls.append(ToolCall(tool=data["tool"], params=data["params"], raw=raw_block))
+            calls.append(
+                LegacyMarkdownToolCall(tool=data["tool"], params=data["params"], raw=raw_block)
+            )
         else:
             # Distinguish "invalid JSON" from "valid JSON but wrong shape"
             try:
@@ -70,7 +72,7 @@ def parse_legacy_markdown_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
                 continue
             except json.JSONDecodeError:
                 calls.append(
-                    ToolCall(
+                    LegacyMarkdownToolCall(
                         tool="__invalid__",
                         params={"error": f"Invalid JSON: {json_str[:200]}"},
                         raw=raw_block,
@@ -85,7 +87,9 @@ def parse_legacy_markdown_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
         if m and not any(s <= m.start() < e for s, e in consumed_spans):
             data = _try_parse_tool_json(m.group(1))
             if data is not None:
-                calls.append(ToolCall(tool=data["tool"], params=data["params"], raw=m.group(0)))
+                calls.append(
+                    LegacyMarkdownToolCall(tool=data["tool"], params=data["params"], raw=m.group(0))
+                )
                 consumed_spans.append(m.span())
 
     # Strip consumed spans from text
