@@ -7,6 +7,7 @@ from shadow_code.domain.tools import (
     Capability,
     RiskLevel,
     SideEffect,
+    ToolCall,
     ToolError,
     ToolResult,
     ToolSpec,
@@ -20,7 +21,10 @@ class CountArgs(BaseModel):
     label: str
 
 
-def _spec(name: str, handler: Callable[[BaseModel, object], ToolResult] | None = None) -> ToolSpec:
+def _spec(
+    name: str,
+    handler: Callable[[ToolCall, BaseModel, object], ToolResult] | None = None,
+) -> ToolSpec:
     return ToolSpec(
         name=name,
         version="1",
@@ -39,7 +43,7 @@ def _spec(name: str, handler: Callable[[BaseModel, object], ToolResult] | None =
 
 
 def test_registry_is_sorted_immutable_and_rejects_duplicates() -> None:
-    handler = lambda arguments, context: ToolResult(  # noqa: E731
+    handler = lambda call, arguments, context: ToolResult(  # noqa: E731
         call_id="unused", tool_name="unused", output="unused"
     )
     registry = ToolRegistry([_spec("zeta", handler), _spec("alpha", handler)])
@@ -68,7 +72,7 @@ def test_validation_rejects_invalid_arguments_without_invoking_handler(
 ) -> None:
     invocations = 0
 
-    def handler(arguments: BaseModel, context: object) -> ToolResult:
+    def handler(call: ToolCall, arguments: BaseModel, context: object) -> ToolResult:
         nonlocal invocations
         invocations += 1
         return ToolResult(call_id="call-1", tool_name="counter", output="unexpected")
@@ -105,7 +109,7 @@ def test_validation_rejects_unknown_tools_and_envelope_fields() -> None:
 def test_valid_call_returns_exact_model_without_executing_handler() -> None:
     invocations = 0
 
-    def handler(arguments: BaseModel, context: object) -> ToolResult:
+    def handler(call: ToolCall, arguments: BaseModel, context: object) -> ToolResult:
         nonlocal invocations
         invocations += 1
         return ToolResult(call_id="call-1", tool_name="counter", output="unexpected")
@@ -121,10 +125,10 @@ def test_valid_call_returns_exact_model_without_executing_handler() -> None:
 
 
 def test_registry_digest_is_order_stable_and_excludes_handler_identity() -> None:
-    first_handler = lambda arguments, context: ToolResult(  # noqa: E731
+    first_handler = lambda call, arguments, context: ToolResult(  # noqa: E731
         call_id="unused", tool_name="unused", output="one"
     )
-    second_handler = lambda arguments, context: ToolResult(  # noqa: E731
+    second_handler = lambda call, arguments, context: ToolResult(  # noqa: E731
         call_id="unused", tool_name="unused", output="two"
     )
 

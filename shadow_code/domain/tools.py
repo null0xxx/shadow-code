@@ -95,7 +95,7 @@ class ToolResult(FrozenModel):
         return self.error is None
 
 
-ToolHandler = Callable[[BaseModel, object], ToolResult]
+ToolHandler = Callable[[ToolCall, BaseModel, object], ToolResult]
 
 
 class ToolSpec(FrozenModel):

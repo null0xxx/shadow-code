@@ -21,7 +21,7 @@ class CountArgs(BaseModel):
     options: dict[str, list[int]] | None = None
 
 
-def _handler(arguments: BaseModel, context: object) -> ToolResult:
+def _handler(call: ToolCall, arguments: BaseModel, context: object) -> ToolResult:
     raise AssertionError("domain declarations must not execute handlers")
 
 
