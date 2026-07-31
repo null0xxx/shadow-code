@@ -4,6 +4,7 @@ We test the helper functions and importable parts without running the full REPL.
 """
 
 import io
+import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -94,6 +95,44 @@ class TestMainImports(unittest.TestCase):
         from shadow_code.main import _show_context_status
 
         self.assertTrue(callable(_show_context_status))
+
+
+class TestLegacyMarkdownToolBoundary(unittest.TestCase):
+    """Legacy Markdown tool calls must be explicitly enabled at runtime."""
+
+    def test_disabled_boundary_does_not_invoke_legacy_parser(self):
+        from shadow_code.main import _get_legacy_markdown_tool_calls
+
+        with patch("shadow_code.main.parse_legacy_markdown_tool_calls") as parser:
+            calls = _get_legacy_markdown_tool_calls("```tool_call\n{}\n```", enabled=False)
+
+        self.assertEqual(calls, [])
+        parser.assert_not_called()
+
+    def test_enabled_boundary_invokes_legacy_parser(self):
+        from shadow_code.main import _get_legacy_markdown_tool_calls
+
+        expected = [MagicMock()]
+        with patch(
+            "shadow_code.main.parse_legacy_markdown_tool_calls",
+            return_value=("", expected),
+        ) as parser:
+            calls = _get_legacy_markdown_tool_calls("response", enabled=True)
+
+        self.assertEqual(calls, expected)
+        parser.assert_called_once_with("response")
+
+    def test_environment_switch_defaults_to_disabled(self):
+        from shadow_code.config import _env_flag
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS"))
+
+    def test_environment_switch_accepts_explicit_true_value(self):
+        from shadow_code.config import _env_flag
+
+        with patch.dict(os.environ, {"SHADOW_LEGACY_MARKDOWN_TOOLS": "true"}, clear=True):
+            self.assertTrue(_env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS"))
 
 
 class TestOllamaClient(unittest.TestCase):

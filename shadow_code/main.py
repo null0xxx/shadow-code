@@ -18,11 +18,17 @@ import sys
 from datetime import datetime
 
 from . import tools as tool_reg
-from .config import CONTEXT_WINDOW, MAX_CONSECUTIVE_ERRORS, MAX_TOOL_TURNS, MODEL_NAME
+from .config import (
+    CONTEXT_WINDOW,
+    LEGACY_MARKDOWN_TOOLS,
+    MAX_CONSECUTIVE_ERRORS,
+    MAX_TOOL_TURNS,
+    MODEL_NAME,
+)
 from .conversation import Conversation
 from .display import StreamDisplay
 from .ollama_client import OllamaClient
-from .parser import parse_tool_calls
+from .parser import ToolCall, parse_legacy_markdown_tool_calls
 from .prompt import SYSTEM_PROMPT
 from .safety import check_destructive
 from .skills import get_skill, list_skills
@@ -52,6 +58,16 @@ try:
     _HAS_DB = True
 except ImportError:
     _HAS_DB = False
+
+
+def _get_legacy_markdown_tool_calls(
+    response: str, *, enabled: bool = LEGACY_MARKDOWN_TOOLS
+) -> list[ToolCall]:
+    """Parse legacy Markdown tool calls only after explicit runtime opt-in."""
+    if not enabled:
+        return []
+    _, calls = parse_legacy_markdown_tool_calls(response)
+    return calls
 
 
 def main():
@@ -492,8 +508,8 @@ def main():
                     db.add_message(session_id, "assistant", resp)
                     db.update_session_tokens(session_id, conv.total_prompt_tokens)
 
-                # Fallback: check for markdown tool calls (backward compat)
-                _, markdown_calls = parse_tool_calls(resp)
+                # Explicitly opt-in compatibility path for old Markdown tool calls.
+                markdown_calls = _get_legacy_markdown_tool_calls(resp)
                 if not markdown_calls:
                     break  # Pure text response, done
 
