@@ -28,9 +28,14 @@ class CatalogArgs(BaseModel):
 
 
 class ReadFileArgs(CatalogArgs):
-    file_path: str
-    offset: int = Field(default=1, ge=1)
-    limit: int = Field(default=MAX_LINES_TO_READ, ge=1, le=MAX_LINES_TO_READ)
+    file_path: str = Field(description="Absolute path to the file.")
+    offset: int = Field(default=1, ge=1, description="One-based starting line.")
+    limit: int = Field(
+        default=MAX_LINES_TO_READ,
+        ge=1,
+        le=MAX_LINES_TO_READ,
+        description="Maximum number of lines to return.",
+    )
 
     @field_validator("file_path")
     @classmethod
@@ -41,8 +46,13 @@ class ReadFileArgs(CatalogArgs):
 
 
 class BashArgs(CatalogArgs):
-    command: str = Field(min_length=1)
-    timeout: int = Field(default=BASH_DEFAULT_TIMEOUT, ge=1, le=BASH_MAX_TIMEOUT)
+    command: str = Field(min_length=1, description="Shell command to declare.")
+    timeout: int = Field(
+        default=BASH_DEFAULT_TIMEOUT,
+        ge=1,
+        le=BASH_MAX_TIMEOUT,
+        description="Timeout in seconds.",
+    )
 
     @field_validator("command")
     @classmethod

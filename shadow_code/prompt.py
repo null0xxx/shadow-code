@@ -4,6 +4,11 @@
 # 100% static: no f-strings, no dynamic content, no variables.
 # This ensures byte-identical system prompt across requests -> Ollama KV cache hit.
 
+import json
+
+from .tools.projections import SUPPORTED_CONSTRAINT_FACTS, flat_tool_schema
+from .tools.registry import ToolRegistry
+
 SYSTEM_PROMPT = """You are Shadow, a local AI coding assistant. You help users with software engineering tasks using the tools available to you.
 
 CRITICAL RULE: ALWAYS respond in the SAME language the user writes in. If the user writes in Georgian (ქართული), you MUST respond ENTIRELY in Georgian. If the user writes in English, respond in English. NEVER switch languages. This is your #1 priority rule.
@@ -199,3 +204,34 @@ Example:
 - User: "აქ ხარ?" -> You: "დიახ, აქ ვარ! რაში გჭირდება დახმარება?"
 - User: "hello" -> You: "Hello! How can I help?"
 - User: "წაიკითხე ეს ფაილი" -> You: "მოდი წავიკითხო." """
+
+
+def render_tool_documentation(registry: ToolRegistry) -> str:
+    """Render deterministic human-readable documentation from ToolSpecs."""
+    bounds = (*SUPPORTED_CONSTRAINT_FACTS,)
+    lines = ["# Available Tools"]
+    for spec in registry.specs:
+        schema = flat_tool_schema(spec)
+        required = set(schema.get("required", []))
+        lines.extend(
+            [
+                "",
+                f"## {spec.name}",
+                f"Description: {spec.description}",
+                f"Version: {spec.version}",
+                f"Capability: {spec.capability.value}",
+                f"Risk: {spec.risk.value}",
+                f"Side effects: {spec.side_effects.value}",
+                "Arguments:",
+            ]
+        )
+        for name, field in sorted(schema["properties"].items()):
+            facts = [field["type"], "required" if name in required else "optional"]
+            if "default" in field:
+                default = json.dumps(field["default"], ensure_ascii=False, sort_keys=True)
+                facts.append(f"default={default}")
+            facts.extend(f"{key}={field[key]}" for key in bounds if key in field)
+            if "description" in field:
+                facts.append(field["description"])
+            lines.append(f"- {name}: " + "; ".join(facts))
+    return "\n".join(lines) + "\n"

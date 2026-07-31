@@ -4,10 +4,29 @@
 # Tracks prompt_eval_count and eval_count for context management.
 
 import json
+from typing import Any
 
 import requests
 
 from .config import MODEL_NAME, MODEL_OPTIONS, OLLAMA_BASE_URL
+from .tools.projections import flat_tool_schema
+from .tools.registry import ToolRegistry
+
+
+def render_ollama_tool_schemas(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """Project a registry into deterministic Ollama function envelopes."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": flat_tool_schema(spec),
+            },
+        }
+        for spec in registry.specs
+    ]
+
 
 # Tool schemas for Ollama native tool calling API
 TOOL_SCHEMAS = [
