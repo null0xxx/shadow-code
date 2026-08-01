@@ -31,6 +31,8 @@ class SideEffect(str, Enum):
 
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("tool argument object keys must be strings")
         return MappingProxyType({key: _freeze(item) for key, item in sorted(value.items())})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)

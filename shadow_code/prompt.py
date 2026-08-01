@@ -205,6 +205,38 @@ Example:
 - User: "hello" -> You: "Hello! How can I help?"
 - User: "წაიკითხე ეს ფაილი" -> You: "მოდი წავიკითხო." """
 
+_TOOL_SECTION_START = "# Tool Calling Format"
+_TOOL_SECTION_END = "# Doing Tasks"
+_NATIVE_TOOL_SECTION = """# Tool Calling
+
+Use only provider-native tool calls exposed by the runtime. Never emit Markdown
+`tool_call` fences or fabricate tool results. After requesting a tool, wait for its
+real result before continuing."""
+_TEXT_ONLY_TOOL_SECTION = """# Tool Calling
+
+No executable tool protocol is active. Respond with text only and never claim that
+an action ran."""
+_LEGACY_ONLY_INSTRUCTIONS = (
+    "2. NEVER INVENT, ALWAYS VERIFY — never fabricate filenames, paths, APIs, function signatures, or library behavior; verify with read_file/grep/glob/bash before claiming.",
+    "- Do NOT put line numbers in old_string when using edit_file. Copy the exact text from the file.",
+    "- Do NOT chain multiple edit_file calls on the same file without re-reading between edits.",
+    "- Do NOT write ```tool_call blocks in explanations. Only use them to invoke tools.",
+)
+
+
+def render_system_prompt(*, native_tools: bool, legacy_markdown_tools: bool) -> str:
+    """Return a stable prompt aligned with the configured execution protocol."""
+    if legacy_markdown_tools and not native_tools:
+        return SYSTEM_PROMPT
+
+    start = SYSTEM_PROMPT.index(_TOOL_SECTION_START)
+    end = SYSTEM_PROMPT.index(_TOOL_SECTION_END)
+    tool_section = _NATIVE_TOOL_SECTION if native_tools else _TEXT_ONLY_TOOL_SECTION
+    prompt = SYSTEM_PROMPT[:start] + tool_section + "\n\n" + SYSTEM_PROMPT[end:]
+    for instruction in _LEGACY_ONLY_INSTRUCTIONS:
+        prompt = prompt.replace(instruction + "\n", "")
+    return prompt
+
 
 def render_tool_documentation(registry: ToolRegistry) -> str:
     """Render deterministic human-readable documentation from ToolSpecs."""

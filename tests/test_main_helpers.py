@@ -134,6 +134,82 @@ class TestLegacyMarkdownToolBoundary(unittest.TestCase):
         with patch.dict(os.environ, {"SHADOW_LEGACY_MARKDOWN_TOOLS": "true"}, clear=True):
             self.assertTrue(_env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS"))
 
+    def test_disabled_tool_only_fence_returns_typed_protocol_mismatch(self):
+        from shadow_code.domain.tools import ToolError
+        from shadow_code.main import _legacy_markdown_protocol_error
+
+        response = '```tool_call\n{"tool":"read_file","params":{}}\n```'
+        error = _legacy_markdown_protocol_error(response, enabled=False)
+
+        self.assertIsInstance(error, ToolError)
+        self.assertEqual(error.code, "protocol_mismatch")
+        self.assertIn("no action was executed", error.message.lower())
+        self.assertIsNone(_legacy_markdown_protocol_error(response, enabled=True))
+
+
+class TestNativeToolBoundary(unittest.TestCase):
+    """Native calls remain non-executable until admission wiring exists."""
+
+    def test_main_rejects_requested_and_unsolicited_native_calls(self):
+        import importlib
+
+        from shadow_code.conversation import Conversation
+
+        main_module = importlib.import_module("shadow_code.main")
+        native_call = {"function": {"name": "bash", "arguments": {"command": "id"}}}
+
+        for requested in (False, True):
+            client = MagicMock()
+            client.health_check.return_value = (True, "OK")
+            client.last_prompt_tokens = 0
+            client.last_eval_tokens = 0
+            responses = iter((([], [native_call]), (["finished"], [])))
+            prompts = []
+
+            def chat_stream(messages, system, *, _client=client, _state=(prompts, responses)):
+                _state[0].append(system)
+                chunks, _client.last_tool_calls = next(_state[1])
+                return iter(chunks)
+
+            client.chat_stream.side_effect = chat_stream
+            conversation = Conversation()
+            with (
+                self.subTest(requested=requested),
+                patch.object(main_module, "NATIVE_TOOLS", requested, create=True),
+                patch.object(main_module, "_RICH", False),
+                patch.object(main_module, "_HAS_REPL", False),
+                patch.object(main_module, "_HAS_DB", False),
+                patch.object(main_module, "OllamaClient", return_value=client),
+                patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(main_module, "_register_optional_tools"),
+                patch.object(main_module.tool_reg, "register"),
+                patch.object(
+                    main_module.tool_reg,
+                    "dispatch",
+                    return_value=main_module.tool_reg.ToolResult(True, "unexpected"),
+                ) as dispatch,
+                patch.object(main_module.signal, "signal"),
+                patch("builtins.input", side_effect=["do something", "/exit"]),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                patch.object(
+                    conversation,
+                    "add_assistant_tool_call",
+                    wraps=conversation.add_assistant_tool_call,
+                ) as add_call,
+                patch.object(
+                    conversation,
+                    "add_native_tool_result",
+                    wraps=conversation.add_native_tool_result,
+                ) as add_result,
+            ):
+                main_module.main()
+
+            dispatch.assert_not_called()
+            add_call.assert_not_called()
+            add_result.assert_not_called()
+            self.assertIn("No executable tool protocol is active", prompts[0])
+            self.assertIn("native_tools_unavailable", stdout.getvalue())
+
 
 class TestOllamaClient(unittest.TestCase):
     """Basic tests for OllamaClient (no actual server required)."""
@@ -225,6 +301,28 @@ class TestOllamaClient(unittest.TestCase):
             self.assertEqual(chunks, ["Hello", " world"])
             self.assertEqual(client.last_prompt_tokens, 100)
             self.assertEqual(client.last_eval_tokens, 50)
+
+    def test_chat_stream_never_advertises_native_schemas_before_admission_wiring(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        native_call = {"function": {"name": "bash", "arguments": {"command": "id"}}}
+        client = OllamaClient()
+        mock_resp = MagicMock()
+        mock_resp.iter_lines.return_value = [
+            json.dumps({"message": {"tool_calls": [native_call]}, "done": True}).encode()
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with (
+            patch("shadow_code.ollama_client.NATIVE_TOOLS", True, create=True),
+            patch("shadow_code.ollama_client.requests.post", return_value=mock_resp) as post,
+        ):
+            list(client.chat_stream([], "system"))
+
+        self.assertNotIn("tools", post.call_args.kwargs["json"])
+        self.assertEqual(client.last_rejected_native_calls, [native_call])
+        self.assertEqual(getattr(client, "last_tool_calls", []), [])
 
 
 class TestReplCreateSession(unittest.TestCase):

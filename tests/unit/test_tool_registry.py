@@ -106,6 +106,20 @@ def test_validation_rejects_unknown_tools_and_envelope_fields() -> None:
     assert malformed.issues[0].path == ("extra",)
 
 
+def test_validation_normalizes_nested_non_string_mapping_keys() -> None:
+    result = ToolRegistry([_spec("counter")]).validate_call(
+        {
+            "call_id": "call-1",
+            "name": "counter",
+            "arguments": {"count": 1, "label": "x", "nested": {1: "x", "a": "y"}},
+        }
+    )
+
+    assert isinstance(result, ToolError)
+    assert result.code == "invalid_tool_call"
+    assert {issue.path for issue in result.issues} == {("arguments",)}
+
+
 def test_valid_call_returns_exact_model_without_executing_handler() -> None:
     invocations = 0
 

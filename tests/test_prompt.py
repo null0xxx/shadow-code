@@ -2,7 +2,15 @@
 
 import unittest
 
-from shadow_code.prompt import SYSTEM_PROMPT
+import shadow_code.prompt as prompt_module
+
+SYSTEM_PROMPT = prompt_module.SYSTEM_PROMPT
+
+
+def _render_system_prompt(**options: bool) -> str:
+    renderer = getattr(prompt_module, "render_system_prompt", None)
+    assert callable(renderer), "runtime prompt selection is not implemented"
+    return renderer(**options)
 
 
 class TestSystemPrompt(unittest.TestCase):
@@ -80,6 +88,23 @@ class TestSystemPrompt(unittest.TestCase):
         self.assertIn("edit_file", names)
         self.assertIn("write_file", names)
         self.assertIn("grep", names)
+
+    def test_text_only_prompt_has_no_executable_tool_protocol(self):
+        prompt = _render_system_prompt(native_tools=False, legacy_markdown_tools=False)
+
+        self.assertNotIn("```tool_call", prompt)
+        self.assertIn("No executable tool protocol is active", prompt)
+
+    def test_native_prompt_uses_only_provider_native_tools(self):
+        prompt = _render_system_prompt(native_tools=True, legacy_markdown_tools=False)
+
+        self.assertNotIn("```tool_call", prompt)
+        self.assertIn("provider-native tool calls", prompt)
+
+    def test_explicit_legacy_prompt_retains_markdown_protocol(self):
+        prompt = _render_system_prompt(native_tools=False, legacy_markdown_tools=True)
+
+        self.assertIn("```tool_call", prompt)
 
 
 if __name__ == "__main__":
