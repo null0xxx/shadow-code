@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 
 import pytest
 from pydantic import BaseModel
@@ -51,8 +52,8 @@ def test_registry_is_sorted_immutable_and_rejects_duplicates() -> None:
     assert registry.names == ("alpha", "zeta")
     assert tuple(spec.name for spec in registry.specs) == registry.names
     assert ToolRegistry([_spec("declared")]).names == ("declared",)
-    with pytest.raises(AttributeError):
-        registry.names = ()  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        registry.specs = ()  # type: ignore[misc]
     with pytest.raises(ValueError, match="Duplicate tool"):
         ToolRegistry([_spec("same", handler), _spec("same", handler)])
 

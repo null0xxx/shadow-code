@@ -14,9 +14,12 @@ from shadow_code.tool_context import ToolContext
 from shadow_code.tools.catalog import (
     BASH_SPEC,
     DEFAULT_TOOL_REGISTRY,
+    READ_FILE_OUTPUT_LIMIT,
     READ_FILE_SPEC,
     BashArgs,
     ReadFileArgs,
+    _bounded_output,
+    _read_file_handler,
 )
 
 
@@ -129,3 +132,37 @@ def test_bash_is_validatable_but_declaration_only() -> None:
     assert result.spec is BASH_SPEC
     assert result.spec.handler is None
     assert result.model_dump()["arguments"] == BashArgs(command="printf ok").model_dump()
+
+
+@pytest.mark.parametrize("command", ["", " ", "\t\n"])
+def test_bash_rejects_blank_command_declarations(command: str) -> None:
+    result = DEFAULT_TOOL_REGISTRY.validate_call(
+        {"call_id": "bash-blank", "name": "bash", "arguments": {"command": command}}
+    )
+
+    assert isinstance(result, ToolError)
+    assert result.code == "invalid_arguments"
+    assert result.issues[0].path == ("arguments", "command")
+
+
+def test_bounded_output_preserves_both_ends_within_exact_limit() -> None:
+    short = "short output"
+    long = "a" * (READ_FILE_OUTPUT_LIMIT + 500)
+
+    assert _bounded_output(short, READ_FILE_OUTPUT_LIMIT) == short
+    bounded = _bounded_output(long, READ_FILE_OUTPUT_LIMIT)
+    assert len(bounded) == READ_FILE_OUTPUT_LIMIT
+    assert bounded.startswith("a") and bounded.endswith("a")
+    assert "500 chars truncated" in bounded
+
+
+def test_read_file_handler_rejects_wrong_arguments_and_context(tmp_path: Path) -> None:
+    call = ToolCall(call_id="read-contract", name="read_file", arguments={"file_path": "/tmp/x"})
+
+    wrong_arguments = _read_file_handler(call, BashArgs(command="printf ok"), object())
+    wrong_context = _read_file_handler(call, ReadFileArgs(file_path=str(tmp_path / "x")), object())
+
+    assert wrong_arguments.error is not None
+    assert wrong_arguments.error.code == "invalid_arguments"
+    assert wrong_context.error is not None
+    assert wrong_context.error.code == "invalid_context"
