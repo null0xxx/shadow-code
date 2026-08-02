@@ -2,7 +2,13 @@
 
 import unittest
 
-from shadow_code.skills import _SKILLS, get_skill, list_skills, register_skill
+from shadow_code.skills import (
+    _BILINGUAL_PREAMBLE,
+    _SKILLS,
+    get_skill,
+    list_skills,
+    register_skill,
+)
 
 
 class TestSkillRegistry(unittest.TestCase):
@@ -61,7 +67,7 @@ class TestSkillRegistry(unittest.TestCase):
         self.assertIsNotNone(result)
         desc, prompt = result
         self.assertEqual(desc, "A test skill")
-        self.assertEqual(prompt, "Do a test thing")
+        self.assertEqual(prompt, _BILINGUAL_PREAMBLE + "Do a test thing")
         # Cleanup
         del _SKILLS["_test_custom"]
 
@@ -70,7 +76,7 @@ class TestSkillRegistry(unittest.TestCase):
         register_skill("_test_overwrite", "v2", "prompt v2")
         desc, prompt = get_skill("_test_overwrite")
         self.assertEqual(desc, "v2")
-        self.assertEqual(prompt, "prompt v2")
+        self.assertEqual(prompt, _BILINGUAL_PREAMBLE + "prompt v2")
         del _SKILLS["_test_overwrite"]
 
 
@@ -84,7 +90,8 @@ class TestBuiltinSkillContent(unittest.TestCase):
 
     def test_review_skill_mentions_security(self):
         _, prompt = get_skill("review")
-        self.assertIn("Security", prompt)
+        self.assertIn("## SECURITY", prompt)
+        self.assertIn("common-security", prompt)
 
     def test_debug_skill_mentions_root_cause(self):
         _, prompt = get_skill("debug")

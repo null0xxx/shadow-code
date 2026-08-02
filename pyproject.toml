@@ -2,7 +2,7 @@
 name = "shadow-code"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["requests>=2.31.0"]
+dependencies = ["pydantic>=2.12,<3", "requests>=2.31.0"]
 
 [project.optional-dependencies]
 full = ["rich>=13.0.0", "prompt_toolkit>=3.0.0"]

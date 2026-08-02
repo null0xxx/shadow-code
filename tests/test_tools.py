@@ -3,8 +3,28 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from shadow_code.tool_context import ToolContext
+
+
+class TestGetLanguageRulesTool(unittest.TestCase):
+    """Tests for GetLanguageRulesTool defensive execution."""
+
+    def setUp(self):
+        from shadow_code.tools.get_language_rules import GetLanguageRulesTool
+
+        self.tool = GetLanguageRulesTool(ToolContext("/tmp"))
+
+    @patch(
+        "shadow_code.tools.get_language_rules.is_rules_root_available",
+        return_value=True,
+    )
+    def test_execute_rejects_missing_rule_selector(self, _rules_available):
+        result = self.tool.execute({})
+
+        self.assertFalse(result.success)
+        self.assertIn("Provide either 'extension' or 'name'", result.output)
 
 
 class TestReadFileTool(unittest.TestCase):

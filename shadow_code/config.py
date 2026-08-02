@@ -1,10 +1,17 @@
 import os
 
+
+def _env_flag(name: str) -> bool:
+    """Return whether an opt-in environment flag is explicitly enabled."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL_NAME = os.environ.get("SHADOW_MODEL", "shadow-gemma:latest")
 CONTEXT_WINDOW = int(os.environ.get("SHADOW_CTX", "131072"))  # 128K with FlashAttention+q8
 MAX_TOOL_TURNS = 20
 MAX_CONSECUTIVE_ERRORS = 5
+LEGACY_MARKDOWN_TOOLS = _env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS")
 TOOL_OUTPUT_MAX_CHARS = 30_000
 BASH_DEFAULT_TIMEOUT = 120
 BASH_MAX_TIMEOUT = 600

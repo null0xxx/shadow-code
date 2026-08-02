@@ -11,6 +11,7 @@ Why?
   - Cached per session = KV cache hits after first lookup
   - User can also ask for rules explicitly ("show me Python rules")
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -160,10 +161,7 @@ def load_rule_summary(name: str, max_chars: int = 1500) -> str | None:
 
     summary = "\n".join(out).rstrip()
     if len(summary) > max_chars:
-        summary = (
-            summary[:max_chars].rstrip()
-            + "\n\n[...truncated; ask for full rule if needed]"
-        )
+        summary = summary[:max_chars].rstrip() + "\n\n[...truncated; ask for full rule if needed]"
     return summary
 
 

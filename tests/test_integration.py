@@ -17,7 +17,7 @@ from shadow_code import tools as tool_reg
 from shadow_code.conversation import Conversation
 from shadow_code.display import StreamDisplay
 from shadow_code.ollama_client import OllamaClient
-from shadow_code.parser import parse_tool_calls
+from shadow_code.parser import parse_legacy_markdown_tool_calls
 from shadow_code.prompt import SYSTEM_PROMPT
 from shadow_code.safety import check_destructive
 from shadow_code.tool_context import ToolContext
@@ -107,7 +107,7 @@ def _run_repl_turn(client, conv, ctx, user_input, first_message=False):
         conv.update_tokens(client.last_prompt_tokens)
 
         # Parse tool calls
-        _, calls = parse_tool_calls(resp)
+        _, calls = parse_legacy_markdown_tool_calls(resp)
         if not calls:
             break
 

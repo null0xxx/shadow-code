@@ -1,38 +1,11 @@
 """Offline unit tests for parser.py.
 
-Tests the ```tool_call markdown code block format that Phase 0 validation
-confirmed as the model's natural preference.
+Tests the explicitly opt-in legacy ```tool_call``` Markdown format.
 """
 
 import unittest
 
-from shadow_code.parser import TOOL_CALL_RE, parse_tool_calls
-
-
-class TestToolCallRegex(unittest.TestCase):
-    """Test the regex pattern directly."""
-
-    def test_basic_match(self):
-        text = '```tool_call\n{"tool": "bash", "params": {"command": "ls"}}\n```'
-        matches = TOOL_CALL_RE.findall(text)
-        self.assertEqual(len(matches), 1)
-        self.assertIn('"tool": "bash"', matches[0])
-
-    def test_no_match_without_newlines(self):
-        # The format requires newlines around the JSON
-        text = '```tool_call{"tool": "bash", "params": {"command": "ls"}}```'
-        matches = TOOL_CALL_RE.findall(text)
-        self.assertEqual(len(matches), 0)
-
-    def test_extra_whitespace_after_tag(self):
-        text = '```tool_call  \n{"tool": "bash", "params": {"command": "ls"}}\n```'
-        matches = TOOL_CALL_RE.findall(text)
-        self.assertEqual(len(matches), 1)
-
-    def test_multiline_json(self):
-        text = '```tool_call\n{\n  "tool": "bash",\n  "params": {"command": "echo hello"}\n}\n```'
-        matches = TOOL_CALL_RE.findall(text)
-        self.assertEqual(len(matches), 1)
+from shadow_code.parser import parse_legacy_markdown_tool_calls
 
 
 class TestParseToolCalls(unittest.TestCase):
@@ -40,7 +13,7 @@ class TestParseToolCalls(unittest.TestCase):
 
     def test_single_tool_call(self):
         text = 'Let me check.\n```tool_call\n{"tool": "bash", "params": {"command": "ls -la"}}\n```'
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].tool, "bash")
         self.assertEqual(calls[0].params, {"command": "ls -la"})
@@ -52,45 +25,45 @@ class TestParseToolCalls(unittest.TestCase):
             '```tool_call\n{"tool": "bash", "params": {"command": "pwd"}}\n```\n'
             '```tool_call\n{"tool": "bash", "params": {"command": "ls"}}\n```'
         )
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].params["command"], "pwd")
         self.assertEqual(calls[1].params["command"], "ls")
 
     def test_no_tool_calls(self):
         text = "This is just a regular response with no tool calls."
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 0)
         self.assertEqual(clean, text)
 
     def test_invalid_json(self):
         text = "```tool_call\n{not valid json}\n```"
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].tool, "__invalid__")
         self.assertIn("Invalid JSON", calls[0].params["error"])
 
     def test_missing_tool_key(self):
         text = '```tool_call\n{"params": {"command": "ls"}}\n```'
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         # Missing "tool" key -- not a valid tool call, should be skipped
         self.assertEqual(len(calls), 0)
 
     def test_missing_params_key(self):
         text = '```tool_call\n{"tool": "bash"}\n```'
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         # Missing "params" key -- not a valid tool call, should be skipped
         self.assertEqual(len(calls), 0)
 
     def test_wrong_types(self):
         text = '```tool_call\n{"tool": 123, "params": {"command": "ls"}}\n```'
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         # tool is not a string -- should be skipped
         self.assertEqual(len(calls), 0)
 
     def test_params_not_dict(self):
         text = '```tool_call\n{"tool": "bash", "params": "not a dict"}\n```'
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         # params is not a dict -- should be skipped
         self.assertEqual(len(calls), 0)
 
@@ -100,27 +73,27 @@ class TestParseToolCalls(unittest.TestCase):
             '```tool_call\n{"tool": "bash", "params": {"command": "echo hello"}}\n```\n'
             "That should do it."
         )
-        clean, calls = parse_tool_calls(text)
+        clean, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertIn("I'll run this command for you.", clean)
         self.assertIn("That should do it.", clean)
 
     def test_raw_field_contains_full_block(self):
         text = '```tool_call\n{"tool": "bash", "params": {"command": "ls"}}\n```'
-        _, calls = parse_tool_calls(text)
+        _, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].raw, text)
 
     def test_nested_backticks_in_command(self):
         # Command contains backticks but not the full marker pattern
         text = '```tool_call\n{"tool": "bash", "params": {"command": "echo `date`"}}\n```'
-        _, calls = parse_tool_calls(text)
+        _, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].params["command"], "echo `date`")
 
     def test_empty_params(self):
         text = '```tool_call\n{"tool": "list_dir", "params": {}}\n```'
-        _, calls = parse_tool_calls(text)
+        _, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].tool, "list_dir")
         self.assertEqual(calls[0].params, {})
@@ -128,8 +101,24 @@ class TestParseToolCalls(unittest.TestCase):
     def test_regular_code_block_not_matched(self):
         # A normal ```python block should NOT be matched
         text = '```python\nprint("hello")\n```'
-        _, calls = parse_tool_calls(text)
+        _, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 0)
+
+    def test_bash_fence_remains_assistant_text(self):
+        text = "Here is an example:\n```bash\nrm -rf /tmp/example\n```"
+
+        clean, calls = parse_legacy_markdown_tool_calls(text)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(clean, text)
+
+    def test_sh_fence_with_tool_shaped_json_is_not_a_tool_call(self):
+        text = '```sh\n{"tool": "bash", "params": {"command": "pwd"}}\n```'
+
+        clean, calls = parse_legacy_markdown_tool_calls(text)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(clean, text)
 
     def test_tool_call_with_complex_params(self):
         text = (
@@ -138,7 +127,7 @@ class TestParseToolCalls(unittest.TestCase):
             '"old_string": "def foo():", "new_string": "def bar():"}}\n'
             "```"
         )
-        _, calls = parse_tool_calls(text)
+        _, calls = parse_legacy_markdown_tool_calls(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].tool, "edit_file")
         self.assertEqual(calls[0].params["old_string"], "def foo():")

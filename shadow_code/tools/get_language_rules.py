@@ -10,9 +10,9 @@ Two query modes:
 Returns a compact summary (~1.5KB) by default, or the full rule if
 {"full": true} is passed.
 """
+
 from __future__ import annotations
 
-from .base import BaseTool, ToolResult
 from ..rules_loader import (
     KNOWN_RULES,
     is_rules_root_available,
@@ -21,6 +21,7 @@ from ..rules_loader import (
     load_rule_summary,
     rule_for_extension,
 )
+from .base import BaseTool, ToolResult
 
 
 class GetLanguageRulesTool(BaseTool):
@@ -57,9 +58,7 @@ class GetLanguageRulesTool(BaseTool):
             rule_name = params["name"].strip().lower()
             if rule_name not in KNOWN_RULES:
                 avail = ", ".join(sorted(list_available_rules()))
-                return ToolResult(
-                    False, f"Unknown rule '{rule_name}'. Available: {avail}"
-                )
+                return ToolResult(False, f"Unknown rule '{rule_name}'. Available: {avail}")
         elif "extension" in params:
             ext = params["extension"]
             rule_name = rule_for_extension(ext)
@@ -72,16 +71,13 @@ class GetLanguageRulesTool(BaseTool):
                     ),
                 )
 
-        assert rule_name is not None
+        if rule_name is None:
+            return ToolResult(False, "Provide either 'extension' or 'name'.")
+
         loader = load_rule_full if full_mode else load_rule_summary
         content = loader(rule_name)
         if content is None:
-            return ToolResult(
-                False, f"Rule '{rule_name}' could not be loaded from disk."
-            )
+            return ToolResult(False, f"Rule '{rule_name}' could not be loaded from disk.")
 
-        header = (
-            f"=== EAS Rule: {rule_name} "
-            f"({'full' if full_mode else 'summary'}) ===\n"
-        )
+        header = f"=== EAS Rule: {rule_name} ({'full' if full_mode else 'summary'}) ===\n"
         return ToolResult(True, header + content)

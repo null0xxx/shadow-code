@@ -102,7 +102,8 @@ Efficiency:
 register_skill(
     "review",
     "Structured code review (4 sections: ARCHITECT/SECURITY/QA/LEAD + V1-V7)",
-    """Respond in user's language (Georgian if user wrote Georgian; identifiers/paths/code always English).
+    """Respond in user's language (Georgian if user wrote Georgian; identifiers/paths/code always \
+English).
 
 Review the specified file or recently changed code. Single-pass structured review.
 
@@ -436,8 +437,10 @@ Pre-flight checklist:
 
 PostgreSQL safe patterns:
 - Add nullable column: `ALTER TABLE t ADD COLUMN c TEXT;` — instant
-- Add column with default (PG11+): `ALTER TABLE t ADD COLUMN c BOOL NOT NULL DEFAULT true;` — instant
-- Add NOT NULL to existing column: 1) add CHECK constraint NOT VALID, 2) backfill, 3) VALIDATE CONSTRAINT, 4) SET NOT NULL
+- Add column with default (PG11+): `ALTER TABLE t ADD COLUMN c BOOL NOT NULL \
+DEFAULT true;` — instant
+- Add NOT NULL to existing column: 1) add CHECK constraint NOT VALID, 2) backfill, \
+3) VALIDATE CONSTRAINT, 4) SET NOT NULL
 - Index: `CREATE INDEX CONCURRENTLY idx_t_c ON t(c);`
 
 ORM-specific notes (detect from project):
@@ -456,7 +459,8 @@ After writing the migration:
 register_skill(
     "plan",
     "Produce a concrete implementation plan (no edits)",
-    """Respond in user's language (Georgian if user wrote Georgian; identifiers/paths/code always English).
+    """Respond in user's language (Georgian if user wrote Georgian; identifiers/paths/code always \
+English).
 
 Produce a concrete implementation plan for the user's request. Plan ONLY — do NOT
 execute any edits, do NOT call write_file/edit_file/bash. Stop after the plan.
@@ -599,7 +603,8 @@ If designing a new endpoint, output:
 - Pagination: cursor-based preferred (offset only for small datasets); return next/prev cursors
 
 ## Errors
-- 400 validation, 401 auth missing, 403 forbidden, 404 not found, 409 conflict, 410 gone, 422 unprocessable, 429 rate limit, 5xx server
+- 400 validation, 401 auth missing, 403 forbidden, 404 not found, 409 conflict, 410 gone, \
+422 unprocessable, 429 rate limit, 5xx server
 - Error envelope: `{ "error": { "code": "INVALID_INPUT", "message": "...", "details": [...] } }`
 - Never leak internals (stack traces, DB errors)
 

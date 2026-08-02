@@ -195,7 +195,7 @@ def _get_input_app(session_data: dict, model_name: str = "") -> str | None:
         focused_element=text_area,
     )
 
-    app = Application(
+    app: Application[str | None] = Application(
         layout=layout,
         key_bindings=bindings,
         style=_PT_STYLE,

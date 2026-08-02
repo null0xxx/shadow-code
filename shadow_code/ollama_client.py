@@ -4,10 +4,29 @@
 # Tracks prompt_eval_count and eval_count for context management.
 
 import json
+from typing import Any
 
 import requests
 
 from .config import MODEL_NAME, MODEL_OPTIONS, OLLAMA_BASE_URL
+from .tools.projections import flat_tool_schema
+from .tools.registry import ToolRegistry
+
+
+def render_ollama_tool_schemas(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """Project a registry into deterministic Ollama function envelopes."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": flat_tool_schema(spec),
+            },
+        }
+        for spec in registry.specs
+    ]
+
 
 # Tool schemas for Ollama native tool calling API
 TOOL_SCHEMAS = [
@@ -212,14 +231,12 @@ class OllamaClient:
             return False, f"Ollama error: {e}"
 
     def chat_stream(self, messages: list[dict], system: str, model: str | None = None):
-        """Stream a chat completion with native tool support.
+        """Stream text and quarantine unsupported native-call metadata.
 
         Yields:
             str: Text content chunks.
-
-        After iteration, check self.last_tool_calls for any tool calls.
         """
-        self.last_tool_calls: list[dict] = []
+        self.last_rejected_native_calls: list[dict] = []
 
         payload: dict = {
             "model": model or MODEL_NAME,
@@ -227,12 +244,6 @@ class OllamaClient:
             "stream": True,
             "options": MODEL_OPTIONS,
         }
-        # Only add native tools if SHADOW_NATIVE_TOOLS=1 (Gemma 4+)
-        # Gemma 3 doesn't support native tools -- uses markdown ```tool_call format
-        import os
-
-        if os.environ.get("SHADOW_NATIVE_TOOLS") == "1":
-            payload["tools"] = TOOL_SCHEMAS
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
             json=payload,
@@ -257,7 +268,7 @@ class OllamaClient:
             # Native tool calls
             tool_calls = data.get("message", {}).get("tool_calls", [])
             if tool_calls:
-                self.last_tool_calls.extend(tool_calls)
+                self.last_rejected_native_calls.extend(tool_calls)
 
             if data.get("done"):
                 self.last_prompt_tokens = data.get("prompt_eval_count", 0)

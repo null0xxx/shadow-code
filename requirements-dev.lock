@@ -1,0 +1,47 @@
+# Generated from `.venv/bin/python -m pip freeze --all` under Python 3.14.6.
+# The editable shadow-code project is excluded; `make setup` installs it separately.
+# Cross-version transitive dependencies are pinned for the Python 3.10–3.12 CI matrix.
+annotated-types==0.8.0
+ast_serialize==0.6.0
+bandit==1.9.4
+certifi==2026.7.22
+cfgv==3.5.0
+charset-normalizer==3.4.9
+coverage==7.15.2
+distlib==0.4.3
+exceptiongroup==1.3.1
+filelock==3.32.2
+identify==2.6.19
+idna==3.18
+iniconfig==2.3.0
+librt==0.13.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+mypy==2.3.0
+mypy_extensions==1.1.0
+nodeenv==1.10.0
+packaging==26.2
+pathspec==1.1.1
+pip==26.1.2
+platformdirs==4.11.0
+pluggy==1.6.0
+pre_commit==4.6.1
+prompt_toolkit==3.0.53
+pydantic==2.13.4
+pydantic_core==2.46.4
+Pygments==2.20.0
+pytest==9.1.1
+pytest-cov==7.1.0
+python-discovery==1.5.0
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+ruff==0.16.1
+stevedore==5.7.0
+tomli==2.4.1
+types-requests==2.33.0.20260712
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+virtualenv==21.7.1
+wcwidth==0.8.2

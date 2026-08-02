@@ -18,12 +18,19 @@ import sys
 from datetime import datetime
 
 from . import tools as tool_reg
-from .config import CONTEXT_WINDOW, MAX_CONSECUTIVE_ERRORS, MAX_TOOL_TURNS, MODEL_NAME
+from .config import (
+    CONTEXT_WINDOW,
+    LEGACY_MARKDOWN_TOOLS,
+    MAX_CONSECUTIVE_ERRORS,
+    MAX_TOOL_TURNS,
+    MODEL_NAME,
+)
 from .conversation import Conversation
-from .display import StreamDisplay
+from .display import TAG_START, StreamDisplay
+from .domain.tools import ToolError
 from .ollama_client import OllamaClient
-from .parser import parse_tool_calls
-from .prompt import SYSTEM_PROMPT
+from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
+from .prompt import render_system_prompt
 from .safety import check_destructive
 from .skills import get_skill, list_skills
 from .tool_context import ToolContext
@@ -54,9 +61,35 @@ except ImportError:
     _HAS_DB = False
 
 
+def _get_legacy_markdown_tool_calls(
+    response: str, *, enabled: bool = LEGACY_MARKDOWN_TOOLS
+) -> list[LegacyMarkdownToolCall]:
+    """Parse legacy Markdown tool calls only after explicit runtime opt-in."""
+    if not enabled:
+        return []
+    _, calls = parse_legacy_markdown_tool_calls(response)
+    return calls
+
+
+def _legacy_markdown_protocol_error(
+    response: str, *, enabled: bool = LEGACY_MARKDOWN_TOOLS
+) -> ToolError | None:
+    """Describe a rejected legacy envelope without parsing or executing it."""
+    if enabled or TAG_START not in response:
+        return None
+    return ToolError(
+        code="protocol_mismatch",
+        message="Legacy Markdown tool calls are disabled; no action was executed.",
+    )
+
+
 def main():
     cwd = os.getcwd()
     ctx = ToolContext(cwd)
+    system_prompt = render_system_prompt(
+        native_tools=False,
+        legacy_markdown_tools=LEGACY_MARKDOWN_TOOLS,
+    )
 
     # Register all tools
     from .tools.bash import BashTool
@@ -210,7 +243,7 @@ def main():
                 try:
                     from .compaction import compact
 
-                    summary = compact(client, conv.get_messages(), SYSTEM_PROMPT)
+                    summary = compact(client, conv.get_messages(), system_prompt)
                     conv.apply_compaction_summary(summary)
                     print("[Compaction complete]")
                 except Exception as e:
@@ -379,7 +412,7 @@ def main():
             if _RICH and stream_ctrl:
                 try:
                     resp, eval_tokens = stream_ctrl.stream_response(
-                        conv.get_messages(), SYSTEM_PROMPT
+                        conv.get_messages(), system_prompt
                     )
                 except StreamCancelled:
                     print("[Interrupted]")
@@ -393,7 +426,7 @@ def main():
             else:
                 display.reset()
                 try:
-                    for chunk in client.chat_stream(conv.get_messages(), SYSTEM_PROMPT):
+                    for chunk in client.chat_stream(conv.get_messages(), system_prompt):
                         if interrupted:
                             break
                         display.feed(chunk)
@@ -414,76 +447,23 @@ def main():
             state.tokens_used = conv.total_prompt_tokens
             state.turn = turns
 
-            # Check for native tool calls first
-            native_calls = getattr(client, "last_tool_calls", [])
-
+            native_calls = [
+                *getattr(client, "last_rejected_native_calls", []),
+                *getattr(client, "last_tool_calls", []),
+            ]
             if native_calls:
-                # Native tool calling path (Gemma 4+)
-                conv.add_assistant_tool_call(native_calls)
-
-                if db:
-                    db.add_message(session_id, "assistant", f"[tool calls: {len(native_calls)}]")
-
-                for tc in native_calls:
-                    func = tc.get("function", {})
-                    tool_name = func.get("name", "")
-                    params = func.get("arguments", {})
-                    desc = _build_tool_desc(tool_name, params)
-
-                    # Safety check
-                    if tool_name == "bash":
-                        warning = check_destructive(params.get("command", ""))
-                        if warning:
-                            if _RICH:
-                                console.print(ui.render_error(warning))
-                            else:
-                                print(f"  {warning}")
-                            try:
-                                confirm = input("  Proceed? (y/n): ").strip().lower()
-                            except (EOFError, KeyboardInterrupt):
-                                confirm = "n"
-                            if confirm != "y":
-                                conv.add_native_tool_result(tool_name, "Command cancelled by user")
-                                errors += 1
-                                continue
-
-                    if _RICH:
-                        console.print(ui.render_tool_call(tool_name, desc))
-
-                    r = tool_reg.dispatch(tool_name, params)
-
-                    if _RICH:
-                        if tool_name == "edit_file" and r.success:
-                            console.print(
-                                ui.render_diff(
-                                    params.get("old_string", ""),
-                                    params.get("new_string", ""),
-                                    params.get("file_path", ""),
-                                )
-                            )
-                        else:
-                            console.print(
-                                ui.render_tool_result(
-                                    tool_name,
-                                    r.output,
-                                    r.success,
-                                    params=params,
-                                )
-                            )
-                    else:
-                        status = "\u2713" if r.success else "\u2717"
-                        print(f"  {status} [{tool_name}] {desc}")
-                        for line in r.output.splitlines()[:20]:
-                            print(f"    {line}")
-
-                    conv.add_native_tool_result(tool_name, r.output)
-                    errors = errors + 1 if not r.success else 0
-
-                turns += 1
-                if errors >= MAX_CONSECUTIVE_ERRORS:
-                    print(f"[{errors} consecutive errors]")
-                    break
-                continue  # Loop back for model's next response
+                protocol_error = ToolError(
+                    code="native_tools_unavailable",
+                    message=(
+                        "Native tool execution is unavailable until admission and approval "
+                        "wiring is complete; no action was executed."
+                    ),
+                )
+                if _RICH:
+                    console.print(ui.render_error(protocol_error.message))
+                else:
+                    print(f"[{protocol_error.code}] {protocol_error.message}")
+                break
 
             # No native tool calls -- check for text response
             if resp and resp.strip():
@@ -492,9 +472,15 @@ def main():
                     db.add_message(session_id, "assistant", resp)
                     db.update_session_tokens(session_id, conv.total_prompt_tokens)
 
-                # Fallback: check for markdown tool calls (backward compat)
-                _, markdown_calls = parse_tool_calls(resp)
+                # Explicitly opt-in compatibility path for old Markdown tool calls.
+                markdown_calls = _get_legacy_markdown_tool_calls(resp)
                 if not markdown_calls:
+                    protocol_error = _legacy_markdown_protocol_error(resp)
+                    if protocol_error:
+                        if _RICH:
+                            console.print(ui.render_error(protocol_error.message))
+                        else:
+                            print(f"[{protocol_error.code}] {protocol_error.message}")
                     break  # Pure text response, done
 
                 # Execute markdown tool calls (legacy path)
@@ -556,7 +542,7 @@ def main():
             try:
                 from .compaction import compact
 
-                summary = compact(client, conv.get_messages(), SYSTEM_PROMPT)
+                summary = compact(client, conv.get_messages(), system_prompt)
                 conv.apply_compaction_summary(summary)
                 print("[Compaction complete]")
             except Exception as e:
