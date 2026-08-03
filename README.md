@@ -4,51 +4,98 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-orange.svg)](https://ollama.com)
 
-> Local AI coding assistant -- Claude Code's prompts and tools adapted for your own LLM
+> Local Ollama chat assistant with an in-progress, policy-controlled coding runtime
 
-You have a local LLM running on Ollama. **shadow-code** gives it the same coding workflow as Claude Code: tool calling, file editing, git safety, context management -- all running on your machine, no API keys, no cloud.
+## Run the current checkout
 
-## Quick Start
+From the repository root, use the verified local environment and model:
 
 ```bash
-# Install
-pip install -e .
-
-# Optional: Rich UI + prompt_toolkit
-pip install rich prompt_toolkit
-
-# Run (from any directory)
-shadow-code
+SHADOW_MODEL=gemma4-cline:32k .venv/bin/shadow-code
 ```
 
-## What It Does
+When startup succeeds, Shadow Code displays this prompt:
 
-```
-shadow> find all python files with syntax errors
-
-  > grep syntax error **/*.py
-    src/parser.py:45: syntax error near "def"
-
-  > read_file src/parser.py
-    ...line 45 shown with context...
-
-  > edit_file src/parser.py
-    Fixed: missing colon after function definition
-
-  [===========--------] 45K/131K (34%)
+```text
+shadow>
 ```
 
-shadow-code sends your question to the local LLM, which decides what tools to use, executes them, reads the results, and continues until the task is done.
+You can now ask questions, explain code you paste into the conversation, and use the
+conversation and session commands.
+The safe default is **chat-only**: native tool calls fail closed and execute nothing until
+the admission and approval wiring is complete.
+
+## Install and run elsewhere
+
+### Prerequisites
+
+- Python 3.10+
+- [Ollama](https://ollama.com), running locally
+- An Ollama model already pulled, for example `gemma4-cline:32k`
+
+Install Shadow Code in a virtual environment:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e '.[full]'
+```
+
+Start it with the name of a model available in Ollama:
+
+```bash
+SHADOW_MODEL=<ollama-model-name> .venv/bin/shadow-code
+```
+
+If Ollama is not available at `http://localhost:11434`, set `OLLAMA_HOST`:
+
+```bash
+OLLAMA_HOST=http://localhost:11434 \
+SHADOW_MODEL=<ollama-model-name> \
+.venv/bin/shadow-code
+```
+
+## Current capabilities
+
+Shadow Code sends your messages to the selected local Ollama model and streams its text
+responses. The current default runtime supports:
+
+- local chat without API keys or cloud model calls;
+- conversation history, context management, and session persistence;
+- slash commands such as `/help`, `/save`, `/load`, and `/compact`;
+- optional Rich and prompt-toolkit terminal presentation.
+
+### Native tool limitation
+
+Native coding-agent tool calls are recognized but **not executed**. Shadow Code reports
+`native_tools_unavailable` and stops that tool turn. This fail-closed behavior is intentional:
+the PolicyEngine exists, but production admission, approval, and executor wiring is not yet
+complete.
+
+Therefore, the current safe/default build must not be described as a fully operational coding
+agent: it cannot yet safely read, edit, or execute project files through native tool calls.
+
+### Legacy Markdown tools (compatibility only)
+
+An older Markdown-based tool protocol can be enabled explicitly:
+
+```bash
+SHADOW_MODEL=gemma4-cline:32k \
+SHADOW_LEGACY_MARKDOWN_TOOLS=1 \
+.venv/bin/shadow-code
+```
+
+> **Warning:** Use this mode only in a disposable workspace with no secrets or valuable
+> uncommitted changes. It bypasses the new native admission and approval path and can invoke
+> file and shell tools. It is a compatibility path, not the production-safe runtime.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **7 Tools** | bash, read_file, edit_file, write_file, glob, grep, list_dir |
-| **13 Skills** | /commit, /review, /debug, /test, /refactor, /explain, and more |
+| **Safe default** | Local text chat; native tool requests fail closed without execution |
+| **Legacy tools** | Optional compatibility path for bash, file, glob, grep, and directory tools |
+| **13 Skill prompts** | `/review`, `/debug`, `/explain`, and more; tool-dependent actions remain unavailable by default |
 | **Context Management** | 3-tier: result clearing, LLM compaction, emergency truncate |
-| **Git Safety** | Never skips hooks, never force pushes, never amends without asking |
-| **Destructive Warnings** | Confirms before rm -rf, git reset --hard, drop table |
 | **Session Persistence** | Save/load conversations with SQLite |
 | **Georgian + English** | Responds in the language you write in |
 | **Rich UI** | Markdown rendering, spinners, color-coded context bar |
@@ -72,6 +119,9 @@ shadow-code sends your question to the local LLM, which decides what tools to us
 ```
 
 ## Skills
+
+These commands load task-specific prompts. In the safe/default mode, they can guide analysis
+and text responses, but commands that require file or shell tools cannot execute those tools.
 
 ```
 /commit        Create a git commit
@@ -101,6 +151,7 @@ shadow-code sends your question to the local LLM, which decides what tools to us
 |---------------------|---------|-------------|
 | `SHADOW_MODEL` | `shadow-gemma:latest` | Ollama model to use |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API URL |
+| `SHADOW_LEGACY_MARKDOWN_TOOLS` | disabled | Opt in to the unsafe compatibility tool path |
 
 ## Architecture
 
@@ -109,19 +160,19 @@ shadow-code/
   shadow_code/
     main.py           Entry point, REPL, context management
     prompt.py          System prompt (Claude Code adapted, 17K chars)
-    parser.py          Tool call detection (```tool_call format)
+    parser.py          Legacy Markdown tool call detection
     ollama_client.py   Ollama API streaming client
     conversation.py    Message history, 3-tier context management
     display.py         Streaming buffer (hides tool JSON from user)
     compaction.py      LLM-based conversation summarization
     skills.py          Skill system (/commit, /review, etc.)
-    safety.py          Destructive command detection
+    safety.py          Legacy destructive command detection
     ui.py              Rich terminal rendering
     streaming.py       Rich Live streaming display
     repl.py            prompt_toolkit REPL with history
     db.py              SQLite session persistence
     tool_context.py    Shared state (CWD, read files)
-    tools/
+    tools/             Legacy compatibility tool implementations
       bash.py          Shell commands with CWD tracking
       read_file.py     File reading with line numbers
       edit_file.py     Exact string replacement
@@ -133,10 +184,11 @@ shadow-code/
 
 ## How It Works
 
-1. **System prompt** (adapted from Claude Code) tells the LLM about available tools, coding best practices, and behavioral rules
-2. **Tool calling** uses ` ```tool_call ` markdown format (validated with the actual model)
-3. **Context management** follows Claude Code's pattern: clear old results at 55%, LLM summarization at 65%, emergency truncate at 85%
-4. **KV cache** optimization: system prompt is 100% static for Ollama cache hits
+1. **System prompt** tells the LLM about coding practices and the currently enabled protocols
+2. **Native tool calling** currently fails closed until admission and approval wiring is complete
+3. **Legacy tool calling** uses ` ```tool_call ` Markdown only when explicitly enabled
+4. **Context management** follows Claude Code's pattern: clear old results at 55%, LLM summarization at 65%, emergency truncate at 85%
+5. **KV cache** optimization: system prompt is 100% static for Ollama cache hits
 
 ## License
 
