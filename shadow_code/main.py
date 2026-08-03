@@ -22,18 +22,25 @@ from .config import (
     CONTEXT_WINDOW,
     LEGACY_MARKDOWN_TOOLS,
     MAX_CONSECUTIVE_ERRORS,
+    MAX_NATIVE_TOOL_TURNS,
     MAX_TOOL_TURNS,
     MODEL_NAME,
 )
 from .conversation import Conversation
 from .display import TAG_START, StreamDisplay
-from .domain.tools import ToolError
-from .ollama_client import OllamaClient
+from .domain.policy import PolicyDisposition, PolicyFacts, WorkspaceAccessError
+from .domain.tools import Capability, ToolError, ToolResult
+from .executor import execute_validated_call
+from .ollama_client import OllamaClient, render_ollama_tool_schemas
 from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
-from .prompt import render_system_prompt
+from .policy.engine import PolicyEngine
+from .policy.workspace import WorkspaceGuard
+from .prompt import render_system_prompt, render_tool_documentation
 from .safety import check_destructive
 from .skills import get_skill, list_skills
 from .tool_context import ToolContext
+from .tools.catalog import READ_FILE_SPEC, WorkspaceContext
+from .tools.registry import ToolRegistry
 
 # Optional imports -- graceful fallback
 try:
@@ -83,13 +90,83 @@ def _legacy_markdown_protocol_error(
     )
 
 
+def _admit_native_calls(
+    native_calls: list[dict],
+    registry: ToolRegistry,
+    policy_engine: PolicyEngine,
+    execution_context: WorkspaceContext,
+) -> list[ToolResult]:
+    """Run collected native calls through validate -> policy -> execute.
+
+    Fail-closed at every step: invalid envelopes, unregistered tools, policy
+    denials, and approval-required calls all produce typed error results and
+    never reach a handler.
+    """
+    results = []
+    for raw_call in native_calls:
+        validated = registry.validate_call(raw_call)
+        if isinstance(validated, ToolError):
+            fallback_id = raw_call.get("call_id") if isinstance(raw_call, dict) else None
+            fallback_name = raw_call.get("name") if isinstance(raw_call, dict) else None
+            results.append(
+                ToolResult(
+                    call_id=fallback_id or "invalid-call",
+                    tool_name=fallback_name or "unknown",
+                    error=validated,
+                )
+            )
+            continue
+
+        decision = policy_engine.decide(validated)
+        if decision.disposition is PolicyDisposition.ALLOW:
+            results.append(execute_validated_call(validated, execution_context))
+        elif decision.disposition is PolicyDisposition.DENY:
+            results.append(
+                ToolResult(
+                    call_id=validated.call.call_id,
+                    tool_name=validated.call.name,
+                    error=ToolError(
+                        code="policy_denied",
+                        message=f"Policy denied execution ({decision.reason.value}).",
+                    ),
+                )
+            )
+        else:
+            results.append(
+                ToolResult(
+                    call_id=validated.call.call_id,
+                    tool_name=validated.call.name,
+                    error=ToolError(
+                        code="approval_unavailable",
+                        message=("Approval authority is not wired yet; the call was not executed."),
+                    ),
+                )
+            )
+    return results
+
+
 def main():
     cwd = os.getcwd()
     ctx = ToolContext(cwd)
+
+    # Read-only admission: containment guard, policy facts, runtime registry.
+    # Only read_file is advertised; bash remains declaration-only.
+    try:
+        workspace_guard = WorkspaceGuard(cwd)
+    except WorkspaceAccessError as e:
+        print(f"Error: cannot establish workspace containment: {e}", file=sys.stderr)
+        sys.exit(1)
+    runtime_registry = ToolRegistry((READ_FILE_SPEC,))
+    policy_engine = PolicyEngine(
+        PolicyFacts({Capability.FILESYSTEM_READ}, workspace_guard.identity)
+    )
+    execution_context = WorkspaceContext(guard=workspace_guard)
+    tool_schemas = render_ollama_tool_schemas(runtime_registry)
     system_prompt = render_system_prompt(
-        native_tools=False,
+        native_tools=True,
         legacy_markdown_tools=LEGACY_MARKDOWN_TOOLS,
     )
+    system_prompt += "\n\n" + render_tool_documentation(runtime_registry)
 
     # Register all tools
     from .tools.bash import BashTool
@@ -404,6 +481,7 @@ def main():
         # === Tool execution loop (native tool calling) ===
         turns = 0
         errors = 0
+        native_rounds = 0
 
         while turns < MAX_TOOL_TURNS:
             interrupted = False
@@ -412,7 +490,7 @@ def main():
             if _RICH and stream_ctrl:
                 try:
                     resp, eval_tokens = stream_ctrl.stream_response(
-                        conv.get_messages(), system_prompt
+                        conv.get_messages(), system_prompt, tools=tool_schemas
                     )
                 except StreamCancelled:
                     print("[Interrupted]")
@@ -426,7 +504,9 @@ def main():
             else:
                 display.reset()
                 try:
-                    for chunk in client.chat_stream(conv.get_messages(), system_prompt):
+                    for chunk in client.chat_stream(
+                        conv.get_messages(), system_prompt, tools=tool_schemas
+                    ):
                         if interrupted:
                             break
                         display.feed(chunk)
@@ -447,23 +527,27 @@ def main():
             state.tokens_used = conv.total_prompt_tokens
             state.turn = turns
 
-            native_calls = [
-                *getattr(client, "last_rejected_native_calls", []),
-                *getattr(client, "last_tool_calls", []),
-            ]
+            # Native tool calls: admission pipeline (validate -> policy -> execute)
+            native_calls = list(getattr(client, "last_tool_calls", []))
             if native_calls:
-                protocol_error = ToolError(
-                    code="native_tools_unavailable",
-                    message=(
-                        "Native tool execution is unavailable until admission and approval "
-                        "wiring is complete; no action was executed."
-                    ),
+                conv.add_assistant_tool_call(native_calls)
+                results = _admit_native_calls(
+                    native_calls, runtime_registry, policy_engine, execution_context
                 )
-                if _RICH:
-                    console.print(ui.render_error(protocol_error.message))
-                else:
-                    print(f"[{protocol_error.code}] {protocol_error.message}")
-                break
+                for result in results:
+                    if result.success:
+                        text = result.output or ""
+                        print(f"  [{result.tool_name}] ok")
+                    else:
+                        text = f"[{result.error.code}] {result.error.message}"
+                        print(f"  [{result.tool_name}] {result.error.code}")
+                    conv.add_native_tool_result(result.tool_name, text)
+                turns += 1
+                native_rounds += 1
+                if native_rounds >= MAX_NATIVE_TOOL_TURNS:
+                    print(f"[Native tool limit ({MAX_NATIVE_TOOL_TURNS}) reached]")
+                    break
+                continue
 
             # No native tool calls -- check for text response
             if resp and resp.strip():
@@ -553,6 +637,7 @@ def main():
                 print("[Emergency truncation applied]")
 
     # Cleanup
+    workspace_guard.close()
     if db:
         db.close()
     print("Goodbye!")

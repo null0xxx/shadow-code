@@ -147,40 +147,55 @@ class TestLegacyMarkdownToolBoundary(unittest.TestCase):
         self.assertIsNone(_legacy_markdown_protocol_error(response, enabled=True))
 
 
-class TestNativeToolBoundary(unittest.TestCase):
-    """Native calls remain non-executable until admission wiring exists."""
+class TestNativeToolAdmission(unittest.TestCase):
+    """Read-only native calls execute through the admission pipeline."""
 
-    def test_main_rejects_requested_and_unsolicited_native_calls(self):
+    def test_main_executes_read_only_native_calls_through_pipeline(self):
         import importlib
+        import tempfile
 
         from shadow_code.conversation import Conversation
+        from shadow_code.policy.workspace import WorkspaceGuard
 
         main_module = importlib.import_module("shadow_code.main")
-        native_call = {"function": {"name": "bash", "arguments": {"command": "id"}}}
+        native_call = {
+            "call_id": "call-0",
+            "name": "read_file",
+            "arguments": {"file_path": "hello.txt"},
+        }
 
-        for requested in (False, True):
+        with tempfile.TemporaryDirectory() as workspace:
+            with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
+                handle.write("admitted content\n")
+
             client = MagicMock()
             client.health_check.return_value = (True, "OK")
             client.last_prompt_tokens = 0
             client.last_eval_tokens = 0
             responses = iter((([], [native_call]), (["finished"], [])))
+            payloads = []
             prompts = []
 
-            def chat_stream(messages, system, *, _client=client, _state=(prompts, responses)):
-                _state[0].append(system)
-                chunks, _client.last_tool_calls = next(_state[1])
+            def chat_stream(messages, system, model=None, tools=None):
+                prompts.append(system)
+                payloads.append(tools)
+                chunks, client.last_tool_calls = next(responses)
                 return iter(chunks)
 
             client.chat_stream.side_effect = chat_stream
             conversation = Conversation()
+
             with (
-                self.subTest(requested=requested),
-                patch.object(main_module, "NATIVE_TOOLS", requested, create=True),
                 patch.object(main_module, "_RICH", False),
                 patch.object(main_module, "_HAS_REPL", False),
                 patch.object(main_module, "_HAS_DB", False),
                 patch.object(main_module, "OllamaClient", return_value=client),
                 patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(
+                    main_module,
+                    "WorkspaceGuard",
+                    side_effect=lambda root, **kw: WorkspaceGuard(workspace),
+                ),
                 patch.object(main_module, "_register_optional_tools"),
                 patch.object(main_module.tool_reg, "register"),
                 patch.object(
@@ -189,7 +204,7 @@ class TestNativeToolBoundary(unittest.TestCase):
                     return_value=main_module.tool_reg.ToolResult(True, "unexpected"),
                 ) as dispatch,
                 patch.object(main_module.signal, "signal"),
-                patch("builtins.input", side_effect=["do something", "/exit"]),
+                patch("builtins.input", side_effect=["read hello", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 patch.object(
                     conversation,
@@ -205,10 +220,101 @@ class TestNativeToolBoundary(unittest.TestCase):
                 main_module.main()
 
             dispatch.assert_not_called()
-            add_call.assert_not_called()
-            add_result.assert_not_called()
-            self.assertIn("No executable tool protocol is active", prompts[0])
-            self.assertIn("native_tools_unavailable", stdout.getvalue())
+            add_call.assert_called_once_with([native_call])
+            add_result.assert_called_once()
+            tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertEqual(tool_messages[0]["name"], "read_file")
+            self.assertIn("admitted content", tool_messages[0]["content"])
+
+            # Every streamed turn advertises exactly the read-only schema.
+            self.assertEqual(len(payloads), 2)
+            for tools in payloads:
+                self.assertIsNotNone(tools)
+                self.assertEqual([t["function"]["name"] for t in tools], ["read_file"])
+
+            # System prompt uses the native section plus generated tool docs.
+            self.assertNotIn("No executable tool protocol is active", prompts[0])
+            self.assertIn("## read_file", prompts[0])
+            self.assertNotIn("native_tools_unavailable", stdout.getvalue())
+
+
+class TestAdmitNativeCalls(unittest.TestCase):
+    """The admission pipeline fails closed without executing handlers."""
+
+    def test_bash_unknown_and_malformed_calls_never_execute(self):
+        import tempfile
+
+        from shadow_code.domain.tools import Capability
+        from shadow_code.main import _admit_native_calls
+        from shadow_code.policy.workspace import WorkspaceGuard
+        from shadow_code.tools.catalog import READ_FILE_SPEC, WorkspaceContext
+
+        calls = [
+            {"call_id": "c1", "name": "bash", "arguments": {"command": "id"}},
+            {"call_id": "c2", "name": "nope", "arguments": {}},
+            {"call_id": "c3", "name": "", "arguments": {}},
+            "not-a-dict",
+        ]
+        with tempfile.TemporaryDirectory() as workspace, WorkspaceGuard(workspace) as guard:
+            from shadow_code.domain.policy import PolicyFacts
+            from shadow_code.policy.engine import PolicyEngine
+            from shadow_code.tools.registry import ToolRegistry
+
+            registry = ToolRegistry((READ_FILE_SPEC,))
+            engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
+            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual(
+            [r.error.code for r in results],
+            ["unknown_tool", "unknown_tool", "invalid_tool_call", "invalid_tool_call"],
+        )
+        for result in results:
+            self.assertFalse(result.success)
+
+    def test_side_effecting_calls_fail_closed_without_approval_authority(self):
+        import tempfile
+
+        from shadow_code.domain.policy import PolicyFacts
+        from shadow_code.domain.tools import Capability
+        from shadow_code.main import _admit_native_calls
+        from shadow_code.policy.engine import PolicyEngine
+        from shadow_code.policy.workspace import WorkspaceGuard
+        from shadow_code.tools.catalog import BASH_SPEC, READ_FILE_SPEC, WorkspaceContext
+        from shadow_code.tools.registry import ToolRegistry
+
+        with tempfile.TemporaryDirectory() as workspace, WorkspaceGuard(workspace) as guard:
+            registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
+            capabilities = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
+            engine = PolicyEngine(PolicyFacts(capabilities, guard.identity))
+            calls = [{"call_id": "b1", "name": "bash", "arguments": {"command": "id"}}]
+            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "approval_unavailable")
+
+    def test_ungranted_capability_is_a_typed_policy_denial(self):
+        import tempfile
+
+        from shadow_code.domain.policy import PolicyFacts
+        from shadow_code.domain.tools import Capability
+        from shadow_code.main import _admit_native_calls
+        from shadow_code.policy.engine import PolicyEngine
+        from shadow_code.policy.workspace import WorkspaceGuard
+        from shadow_code.tools.catalog import BASH_SPEC, READ_FILE_SPEC, WorkspaceContext
+        from shadow_code.tools.registry import ToolRegistry
+
+        with tempfile.TemporaryDirectory() as workspace, WorkspaceGuard(workspace) as guard:
+            registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
+            engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
+            calls = [{"call_id": "b2", "name": "bash", "arguments": {"command": "id"}}]
+            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "policy_denied")
 
 
 class TestOllamaClient(unittest.TestCase):
@@ -302,27 +408,73 @@ class TestOllamaClient(unittest.TestCase):
             self.assertEqual(client.last_prompt_tokens, 100)
             self.assertEqual(client.last_eval_tokens, 50)
 
-    def test_chat_stream_never_advertises_native_schemas_before_admission_wiring(self):
+    def test_chat_stream_advertises_tools_and_collects_normalized_calls(self):
         import json
 
         from shadow_code.ollama_client import OllamaClient
 
-        native_call = {"function": {"name": "bash", "arguments": {"command": "id"}}}
+        native_call = {"function": {"name": "read_file", "arguments": {"file_path": "a.txt"}}}
+        schemas = [{"type": "function", "function": {"name": "read_file"}}]
         client = OllamaClient()
         mock_resp = MagicMock()
         mock_resp.iter_lines.return_value = [
             json.dumps({"message": {"tool_calls": [native_call]}, "done": True}).encode()
         ]
         mock_resp.raise_for_status = MagicMock()
-        with (
-            patch("shadow_code.ollama_client.NATIVE_TOOLS", True, create=True),
-            patch("shadow_code.ollama_client.requests.post", return_value=mock_resp) as post,
-        ):
-            list(client.chat_stream([], "system"))
+        with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp) as post:
+            list(client.chat_stream([], "system", tools=schemas))
+
+        self.assertEqual(post.call_args.kwargs["json"]["tools"], schemas)
+        self.assertEqual(
+            client.last_tool_calls,
+            [{"call_id": "call-0", "name": "read_file", "arguments": {"file_path": "a.txt"}}],
+        )
+        self.assertFalse(hasattr(client, "last_rejected_native_calls"))
+
+    def test_chat_stream_omits_tools_key_without_schemas(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        client = OllamaClient()
+        mock_resp = MagicMock()
+        mock_resp.iter_lines.return_value = [
+            json.dumps({"message": {"content": "hi"}, "done": True}).encode()
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp) as post:
+            self.assertEqual(list(client.chat_stream([], "system")), ["hi"])
 
         self.assertNotIn("tools", post.call_args.kwargs["json"])
-        self.assertEqual(client.last_rejected_native_calls, [native_call])
-        self.assertEqual(getattr(client, "last_tool_calls", []), [])
+        self.assertEqual(client.last_tool_calls, [])
+
+    def test_chat_stream_normalizes_malformed_calls_without_executing(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        raw_calls = [
+            {"id": "provider-1", "function": {"name": "read_file", "arguments": '{"a": 1}'}},
+            {"function": {"name": 42, "arguments": "not-json"}},
+            "garbage",
+        ]
+        client = OllamaClient()
+        mock_resp = MagicMock()
+        mock_resp.iter_lines.return_value = [
+            json.dumps({"message": {"tool_calls": raw_calls}, "done": True}).encode()
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp):
+            list(client.chat_stream([], "system"))
+
+        self.assertEqual(
+            client.last_tool_calls,
+            [
+                {"call_id": "provider-1", "name": "read_file", "arguments": {"a": 1}},
+                {"call_id": "call-1", "name": "", "arguments": "not-json"},
+                {"call_id": "call-2", "name": "", "arguments": {}},
+            ],
+        )
 
 
 class TestReplCreateSession(unittest.TestCase):
