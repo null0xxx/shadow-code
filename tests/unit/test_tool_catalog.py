@@ -10,7 +10,7 @@ from shadow_code.domain.tools import (
     ToolError,
     ValidatedToolCall,
 )
-from shadow_code.tool_context import ToolContext
+from shadow_code.policy.workspace import WorkspaceGuard
 from shadow_code.tools.catalog import (
     BASH_SPEC,
     DEFAULT_TOOL_REGISTRY,
@@ -18,6 +18,7 @@ from shadow_code.tools.catalog import (
     READ_FILE_SPEC,
     BashArgs,
     ReadFileArgs,
+    WorkspaceContext,
     _bounded_output,
     _read_file_handler,
 )
@@ -39,15 +40,21 @@ def test_default_catalog_has_exact_order_and_truthful_metadata() -> None:
     "arguments",
     [
         {},
-        {"file_path": "relative.txt"},
-        {"file_path": "/tmp/file", "limit": "1"},
-        {"file_path": "/tmp/file", "limit": True},
-        {"file_path": "/tmp/file", "offset": 0},
-        {"file_path": "/tmp/file", "offset": -1},
-        {"file_path": "/tmp/file", "limit": 0},
-        {"file_path": "/tmp/file", "limit": -1},
-        {"file_path": "/tmp/file", "limit": 2_001},
-        {"file_path": "/tmp/file", "unknown": 1},
+        {"file_path": "/absolute.txt"},
+        {"file_path": ".."},
+        {"file_path": "dir/../file.txt"},
+        {"file_path": "dir//file.txt"},
+        {"file_path": "./file.txt"},
+        {"file_path": ""},
+        {"file_path": "file\x00x.txt"},
+        {"file_path": "file.txt", "limit": "1"},
+        {"file_path": "file.txt", "limit": True},
+        {"file_path": "file.txt", "offset": 0},
+        {"file_path": "file.txt", "offset": -1},
+        {"file_path": "file.txt", "limit": 0},
+        {"file_path": "file.txt", "limit": -1},
+        {"file_path": "file.txt", "limit": 2_001},
+        {"file_path": "file.txt", "unknown": 1},
         "not-an-object",
     ],
 )
@@ -63,11 +70,12 @@ def test_read_file_arguments_are_strict_and_never_reach_handler(arguments: objec
 def test_read_file_handler_returns_correlated_bounded_result(tmp_path: Path) -> None:
     path = tmp_path / "large.txt"
     path.write_text("x" * 31_000, encoding="utf-8")
-    call = ToolCall(call_id="read-1", name="read_file", arguments={"file_path": str(path)})
+    call = ToolCall(call_id="read-1", name="read_file", arguments={"file_path": "large.txt"})
     handler = READ_FILE_SPEC.handler
 
     assert handler is not None
-    result = handler(call, ReadFileArgs(file_path=str(path)), ToolContext(str(tmp_path)))
+    with WorkspaceGuard(tmp_path) as guard:
+        result = handler(call, ReadFileArgs(file_path="large.txt"), WorkspaceContext(guard))
 
     assert result.success is True
     assert result.call_id == "read-1"
@@ -75,52 +83,81 @@ def test_read_file_handler_returns_correlated_bounded_result(tmp_path: Path) -> 
     assert result.output is not None
     assert len(result.output) <= READ_FILE_SPEC.max_output_chars
     assert "1\t" in result.output
+    assert "chars truncated" in result.output
 
 
-def test_read_file_handler_returns_typed_correlated_error(tmp_path: Path) -> None:
-    missing = tmp_path / "missing.txt"
-    call = ToolCall(call_id="read-2", name="read_file", arguments={"file_path": str(missing)})
+def test_read_file_handler_reads_relative_path_through_guard(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "hello.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    call = ToolCall(
+        call_id="read-rel", name="read_file", arguments={"file_path": "nested/hello.txt"}
+    )
     handler = READ_FILE_SPEC.handler
 
     assert handler is not None
-    result = handler(call, ReadFileArgs(file_path=str(missing)), ToolContext(str(tmp_path)))
+    with WorkspaceGuard(tmp_path) as guard:
+        result = handler(
+            call,
+            ReadFileArgs(file_path="nested/hello.txt", offset=2, limit=1),
+            WorkspaceContext(guard),
+        )
+
+    assert result.success is True
+    assert result.output == "2\tbeta"
+
+
+def test_read_file_handler_rejects_symlinks_via_containment(tmp_path: Path) -> None:
+    (tmp_path / "real.txt").write_text("real", encoding="utf-8")
+    (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
+    call = ToolCall(call_id="read-link", name="read_file", arguments={"file_path": "link.txt"})
+    handler = READ_FILE_SPEC.handler
+
+    assert handler is not None
+    with WorkspaceGuard(tmp_path) as guard:
+        result = handler(call, ReadFileArgs(file_path="link.txt"), WorkspaceContext(guard))
+
+    assert result.success is False
+    assert result.call_id == "read-link"
+    assert result.error is not None
+    assert result.error.code == "containment_violation"
+
+
+def test_read_file_handler_returns_typed_correlated_error(tmp_path: Path) -> None:
+    call = ToolCall(call_id="read-2", name="read_file", arguments={"file_path": "missing.txt"})
+    handler = READ_FILE_SPEC.handler
+
+    assert handler is not None
+    with WorkspaceGuard(tmp_path) as guard:
+        result = handler(call, ReadFileArgs(file_path="missing.txt"), WorkspaceContext(guard))
 
     assert result.success is False
     assert result.call_id == "read-2"
     assert result.tool_name == "read_file"
     assert result.error is not None
-    assert result.error.code == "read_error"
-    assert "not found" in result.error.message.lower()
+    assert result.error.code == "io_error"
 
 
-def test_read_file_handler_normalizes_text_read_oserror(
+def test_read_file_handler_normalizes_read_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "unreadable.txt"
-    path.write_text("content", encoding="utf-8")
-    call = ToolCall(call_id="read-io", name="read_file", arguments={"file_path": str(path)})
-    original_open = open
-    binary_probe_seen = False
+    (tmp_path / "unreadable.txt").write_text("content", encoding="utf-8")
+    call = ToolCall(call_id="read-io", name="read_file", arguments={"file_path": "unreadable.txt"})
 
-    def fail_text_open(file: object, mode: str = "r", *args: object, **kwargs: object):
-        nonlocal binary_probe_seen
-        if mode == "rb":
-            binary_probe_seen = True
-        if kwargs.get("encoding") == "utf-8":
-            assert binary_probe_seen
-            raise OSError("deterministic text read failure")
-        return original_open(file, mode, *args, **kwargs)
+    def fail_read(descriptor: int, count: int) -> bytes:
+        raise OSError("deterministic read failure")
 
-    monkeypatch.setattr("builtins.open", fail_text_open)
+    monkeypatch.setattr("shadow_code.tools.catalog.os.read", fail_read)
     handler = READ_FILE_SPEC.handler
     assert handler is not None
 
-    result = handler(call, ReadFileArgs(file_path=str(path)), ToolContext(str(tmp_path)))
+    with WorkspaceGuard(tmp_path) as guard:
+        result = handler(call, ReadFileArgs(file_path="unreadable.txt"), WorkspaceContext(guard))
 
     assert result.error is not None
     assert result.call_id == "read-io"
     assert result.error.code == "read_error"
-    assert "deterministic text read failure" in result.error.message
+    assert "deterministic read failure" in result.error.message
 
 
 def test_bash_is_validatable_but_declaration_only() -> None:
@@ -157,10 +194,10 @@ def test_bounded_output_preserves_both_ends_within_exact_limit() -> None:
 
 
 def test_read_file_handler_rejects_wrong_arguments_and_context(tmp_path: Path) -> None:
-    call = ToolCall(call_id="read-contract", name="read_file", arguments={"file_path": "/tmp/x"})
+    call = ToolCall(call_id="read-contract", name="read_file", arguments={"file_path": "x.txt"})
 
     wrong_arguments = _read_file_handler(call, BashArgs(command="printf ok"), object())
-    wrong_context = _read_file_handler(call, ReadFileArgs(file_path=str(tmp_path / "x")), object())
+    wrong_context = _read_file_handler(call, ReadFileArgs(file_path="x.txt"), object())
 
     assert wrong_arguments.error is not None
     assert wrong_arguments.error.code == "invalid_arguments"

@@ -37,14 +37,18 @@ class StreamController:
         else:
             self.console = console
 
-    def stream_response(self, messages: list[dict], system: str) -> tuple[str, int]:
+    def stream_response(
+        self, messages: list[dict], system: str, tools: list[dict] | None = None
+    ) -> tuple[str, int]:
         """Stream response. Returns (full_response_with_tool_calls, eval_tokens)."""
         if HAS_RICH:
-            return self._stream_rich(messages, system)
+            return self._stream_rich(messages, system, tools)
         else:
-            return self._stream_plain(messages, system)
+            return self._stream_plain(messages, system, tools)
 
-    def _stream_rich(self, messages: list[dict], system: str) -> tuple[str, int]:
+    def _stream_rich(
+        self, messages: list[dict], system: str, tools: list[dict] | None = None
+    ) -> tuple[str, int]:
         """Stream with Rich Live panel + real-time token estimation."""
         self.display.reset()
         accumulated_visible = ""
@@ -57,7 +61,7 @@ class StreamController:
                 refresh_per_second=10,
                 transient=True,
             ) as live:
-                for chunk in self.client.chat_stream(messages, system):
+                for chunk in self.client.chat_stream(messages, system, tools=tools):
                     visible_text = self._feed_and_capture(chunk)
                     char_count += len(chunk)
                     if visible_text:
@@ -84,16 +88,19 @@ class StreamController:
             tokens = self.client.last_eval_tokens
             self.console.print(self.ui.render_response(accumulated_visible, tokens))
 
-        # If no visible text but native tool calls exist, return empty string
-        # (main.py will handle the tool calls via client.last_tool_calls)
+        # If no visible text but native tool calls exist, return empty string;
+        # main.py runs the collected calls through the admission pipeline
+        # (registry validation -> policy -> executor).
         return self.display.get_full_response(), self.client.last_eval_tokens
 
-    def _stream_plain(self, messages: list[dict], system: str) -> tuple[str, int]:
+    def _stream_plain(
+        self, messages: list[dict], system: str, tools: list[dict] | None = None
+    ) -> tuple[str, int]:
         """Fallback: plain stdout streaming."""
         self.display.reset()
 
         try:
-            for chunk in self.client.chat_stream(messages, system):
+            for chunk in self.client.chat_stream(messages, system, tools=tools):
                 self.display.feed(chunk)
         except KeyboardInterrupt:
             self.display.flush()

@@ -4,6 +4,7 @@
 # Tracks prompt_eval_count and eval_count for context management.
 
 import json
+from contextlib import suppress
 from typing import Any
 
 import requests
@@ -206,12 +207,39 @@ TOOL_SCHEMAS = [
 ]
 
 
+def _normalize_tool_call(raw: object, fallback_id: str) -> dict[str, Any]:
+    """Normalize a provider tool-call envelope into registry input shape.
+
+    Malformed payloads are kept as structured data (never executed); the
+    registry's validate_call fails closed on them downstream.
+    """
+    if not isinstance(raw, dict):
+        return {"call_id": fallback_id, "name": "", "arguments": {}}
+    function = raw.get("function")
+    function = function if isinstance(function, dict) else {}
+    arguments = function.get("arguments", {})
+    if isinstance(arguments, str):
+        with suppress(json.JSONDecodeError):
+            arguments = json.loads(arguments)
+        # an unparseable string stays raw; envelope validation fails closed
+    call_id = raw.get("id") or raw.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        call_id = fallback_id
+    name = function.get("name", "")
+    return {
+        "call_id": call_id,
+        "name": name if isinstance(name, str) else "",
+        "arguments": arguments,
+    }
+
+
 class OllamaClient:
     """Client for Ollama /api/chat with native tool calling support."""
 
     def __init__(self):
         self.last_prompt_tokens: int = 0
         self.last_eval_tokens: int = 0
+        self.last_tool_calls: list[dict] = []
 
     def health_check(self) -> tuple[bool, str]:
         """Verify Ollama is running and model is available."""
@@ -230,13 +258,19 @@ class OllamaClient:
         except requests.RequestException as e:
             return False, f"Ollama error: {e}"
 
-    def chat_stream(self, messages: list[dict], system: str, model: str | None = None):
-        """Stream text and quarantine unsupported native-call metadata.
+    def chat_stream(
+        self,
+        messages: list[dict],
+        system: str,
+        model: str | None = None,
+        tools: list[dict] | None = None,
+    ):
+        """Stream text and collect native tool calls for the admission pipeline.
 
         Yields:
             str: Text content chunks.
         """
-        self.last_rejected_native_calls: list[dict] = []
+        self.last_tool_calls = []
 
         payload: dict = {
             "model": model or MODEL_NAME,
@@ -244,6 +278,8 @@ class OllamaClient:
             "stream": True,
             "options": MODEL_OPTIONS,
         }
+        if tools is not None:
+            payload["tools"] = tools
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/chat",
             json=payload,
@@ -265,10 +301,11 @@ class OllamaClient:
             if content:
                 yield content
 
-            # Native tool calls
+            # Native tool calls: collected (normalized), never executed here
             tool_calls = data.get("message", {}).get("tool_calls", [])
-            if tool_calls:
-                self.last_rejected_native_calls.extend(tool_calls)
+            for raw_call in tool_calls:
+                fallback_id = f"call-{len(self.last_tool_calls)}"
+                self.last_tool_calls.append(_normalize_tool_call(raw_call, fallback_id))
 
             if data.get("done"):
                 self.last_prompt_tokens = data.get("prompt_eval_count", 0)

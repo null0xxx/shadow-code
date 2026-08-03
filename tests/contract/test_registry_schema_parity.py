@@ -44,7 +44,7 @@ def test_default_registry_provider_and_prompt_schema_parity() -> None:
 def test_canonical_examples_validate_without_execution() -> None:
     examples = {
         "bash": {"command": "printf ok"},
-        "read_file": {"file_path": "/tmp/example", "offset": 1, "limit": 10},
+        "read_file": {"file_path": "docs/example", "offset": 1, "limit": 10},
     }
 
     for call_id, (name, arguments) in enumerate(examples.items()):
