@@ -101,6 +101,32 @@ def test_policy_domain_types_are_stable_immutable_and_defensively_frozen() -> No
 
 
 @pytest.mark.parametrize(
+    "capabilities",
+    [
+        [Capability.FILESYSTEM_READ, "filesystem.read"],
+        ["filesystem.read", Capability.FILESYSTEM_READ],
+    ],
+)
+def test_policy_facts_rejects_mixed_typed_and_raw_capabilities(
+    capabilities: list[object],
+) -> None:
+    with pytest.raises(TypeError, match="only Capability values"):
+        policy_domain.PolicyFacts(capabilities, _WORKSPACE_IDENTITY)
+
+
+def test_policy_facts_consumes_capability_iterables_once() -> None:
+    capabilities = (
+        capability for capability in (Capability.FILESYSTEM_READ, Capability.NETWORK_ACCESS)
+    )
+
+    facts = policy_domain.PolicyFacts(capabilities, _WORKSPACE_IDENTITY)
+
+    assert facts.granted_capabilities == frozenset(
+        {Capability.FILESYSTEM_READ, Capability.NETWORK_ACCESS}
+    )
+
+
+@pytest.mark.parametrize(
     "input_request",
     [
         ToolCall(call_id="raw-call", name="probe", arguments={}),

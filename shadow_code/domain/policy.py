@@ -50,10 +50,10 @@ class PolicyFacts:
         granted_capabilities: Iterable[Capability],
         workspace_identity: WorkspaceIdentity | None,
     ) -> None:
-        frozen_capabilities = frozenset(granted_capabilities)
-        if any(not isinstance(capability, Capability) for capability in frozen_capabilities):
+        validated_capabilities = tuple(granted_capabilities)
+        if any(not isinstance(capability, Capability) for capability in validated_capabilities):
             raise TypeError("granted_capabilities must contain only Capability values")
-        object.__setattr__(self, "granted_capabilities", frozen_capabilities)
+        object.__setattr__(self, "granted_capabilities", frozenset(validated_capabilities))
         object.__setattr__(self, "workspace_identity", workspace_identity)
 
 
