@@ -177,7 +177,7 @@ def run_process(
     same way and re-raises so the CLI layer can treat it as cancellation.
     """
     byte_budget = max_output_chars * 4
-    process = subprocess.Popen(  # noqa: S603
+    process = subprocess.Popen(  # noqa: S603  # nosec B603 - intentional approval-gated shell execution
         [resolve_shell(), "-c", command],
         cwd=cwd,
         env=dict(env),
