@@ -28,6 +28,8 @@ from shadow_code.mutation import (
     apply_mutation,
     build_edit_plan,
     build_write_plan,
+    export_patch,
+    render_patch,
 )
 from shadow_code.policy.workspace import WorkspaceGuard
 from shadow_code.process import run_process
@@ -47,12 +49,16 @@ class WorkspaceContext:
 
     The process-execution fields default to inert values so read-only
     callers keep working; the bash handler requires a real workspace root.
+    ``mutation_mode`` is "apply" (mutations execute after approval) or
+    "export" (strict mode: approved changes are exported as reviewed patch
+    files and the workspace target is never modified).
     """
 
     guard: WorkspaceGuard
     workspace_root: str = ""
     process_env: Mapping[str, str] = field(default_factory=dict)
     sandbox_label: str = "unconfined"
+    mutation_mode: str = "apply"
 
     def __post_init__(self) -> None:
         # Deep-freeze the mapping so the context stays immutable.
@@ -311,6 +317,7 @@ def _mutation_success_output(plan: MutationPlan, receipt: MutationReceipt) -> st
     return "\n".join(
         [
             f"mutation: {plan.operation} {plan.relative_path}",
+            "status: executed",
             "preview: shown and approved via the exact action plan",
             f"before: {_snapshot_summary(receipt.before)}",
             f"after:  {_snapshot_summary(receipt.after)}",
@@ -320,12 +327,46 @@ def _mutation_success_output(plan: MutationPlan, receipt: MutationReceipt) -> st
     )
 
 
+def _mutation_export_output(plan: MutationPlan, patch_path: str) -> str:
+    return "\n".join(
+        [
+            f"mutation: {plan.operation} {plan.relative_path} [strict: patch export]",
+            "status: exported",
+            f"patch: {patch_path}",
+            f"before: {_snapshot_summary(plan.before)}",
+            f"planned sha256: {plan.new_sha256}",
+            f"planned bytes: {plan.new_size}",
+            "note: the workspace was NOT modified; review and apply the patch manually",
+        ]
+    )
+
+
+def _export_mutation_call(
+    call: ToolCall,
+    context: WorkspaceContext,
+    plan: MutationPlan,
+    new_content: bytes,
+) -> ToolResult:
+    """Strict-mode flow: render the full patch and export it, never apply."""
+    old_bytes: bytes | None = None
+    if plan.before.exists:
+        with context.guard.open_read(plan.relative_path) as descriptor:
+            old_bytes = _read_all_bytes(descriptor)
+    patch_text = render_patch(plan, old_bytes, new_content)
+    patch_path = export_patch(context.guard, plan, patch_text)
+    return ToolResult(
+        call_id=call.call_id,
+        tool_name=call.name,
+        output=_mutation_export_output(plan, patch_path),
+    )
+
+
 def _apply_mutation_call(
     call: ToolCall,
     context: object,
     prepare: Callable[[WorkspaceGuard], tuple[MutationPlan, bytes]],
 ) -> ToolResult:
-    """Shared handler flow: validate context, plan, apply, report."""
+    """Shared handler flow: validate context, plan, then apply or export."""
     if not isinstance(context, WorkspaceContext):
         return ToolResult(
             call_id=call.call_id,
@@ -334,6 +375,10 @@ def _apply_mutation_call(
         )
     try:
         plan, new_content = prepare(context.guard)
+        if context.mutation_mode == "export":
+            # Strict mode: the approved change is exported as a reviewed
+            # patch; apply_mutation is never called on this path.
+            return _export_mutation_call(call, context, plan, new_content)
         receipt = apply_mutation(context.guard, plan, new_content)
     except MutationError as error:
         return _mutation_error_result(call, error)

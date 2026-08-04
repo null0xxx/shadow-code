@@ -12,6 +12,12 @@ an immediate pre-commit re-validation against the planned snapshot, a
 descriptor-relative rename, a directory fsync, and a post-write readback.
 Any drift in identity, content, mode, or presence before the commit aborts
 with the original intact and the temp removed.
+
+In strict mode the mutation is never executed: the planned change is
+rendered as a full unified diff and exported as an isolated patch under
+``<root>/.shadow-code-exports/`` with status ``exported``. The export is a
+reviewed-patch fallback, not confinement; the workspace target is never
+touched on that path.
 """
 
 import difflib
@@ -21,6 +27,7 @@ import secrets
 import stat
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Protocol
 
 from shadow_code.domain.policy import WorkspaceAccessError
@@ -30,6 +37,8 @@ _READ_CHUNK_BYTES = 8192
 _PREVIEW_MAX_LINES = 40
 _NEW_FILE_MODE = 0o644
 _TEMP_PREFIX = ".shadow-tmp-"
+_EXPORT_DIR_MODE = 0o755
+_EXPORT_FILE_MODE = 0o644
 
 
 class MutationError(RuntimeError):
@@ -308,3 +317,98 @@ def apply_mutation(
                 f"post-write readback of '{plan.relative_path}' does not match the approved digest",
             )
         return MutationReceipt(before=plan.before, after=after, bytes_written=len(new_content))
+
+
+def render_patch(plan: MutationPlan, old_bytes: bytes | None, new_bytes: bytes) -> str:
+    """Full, deterministic unified diff for the strict-mode patch export.
+
+    Unlike the bounded approval preview, the exported patch is complete: it
+    is the reviewable artifact the user applies manually. New files diff
+    from ``/dev/null``; there are no timestamps, so identical plans render
+    identical patches.
+    """
+    if len(new_bytes) != plan.new_size or (
+        hashlib.sha256(new_bytes).hexdigest() != plan.new_sha256
+    ):
+        raise MutationError("invalid_plan", "content does not match the mutation plan")
+    fromfile = "/dev/null" if old_bytes is None else f"a/{plan.relative_path}"
+    old_lines = (
+        []
+        if old_bytes is None
+        else old_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
+    )
+    new_lines = new_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=fromfile,
+        tofile=f"b/{plan.relative_path}",
+    )
+    return "".join(diff)
+
+
+def export_patch(
+    guard: WorkspaceGuard,
+    plan: MutationPlan,
+    patch_text: str,
+    exports_dir_name: str = ".shadow-code-exports",
+) -> str:
+    """Write a reviewed patch beneath the workspace root and return its path.
+
+    This is the strict-mode fallback for an approved mutation: the change is
+    recorded as an isolated patch under ``<root>/<exports_dir_name>/`` with
+    status ``exported`` and the workspace target is NEVER touched. The export
+    is a reviewed-patch fallback, not confinement.
+
+    The exports directory is created descriptor-relative to the pinned root;
+    a symlink or non-directory at that path fails closed through the guard.
+    Names are deterministic (UTC stamp, operation, basename) with a short
+    random token appended only on collision. The file is written, fsynced,
+    and the directory fsynced; the workspace-relative patch path is returned.
+    """
+    _, _, basename = plan.relative_path.rpartition("/")
+    with guard.mutation_lock():
+        with guard.open_dir(".") as root_fd:
+            try:
+                os.mkdir(exports_dir_name, _EXPORT_DIR_MODE, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise MutationError(
+                    "io_error", f"cannot create exports directory: {error.strerror or error}"
+                ) from error
+        with guard.open_dir(exports_dir_name) as exports_fd:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            safe_base = basename.replace("/", "_")
+            name = f"{stamp}-{plan.operation}-{safe_base}.patch"
+            descriptor: int | None = None
+            try:
+                for _ in range(2):
+                    try:
+                        descriptor = os.open(
+                            name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            _EXPORT_FILE_MODE,
+                            dir_fd=exports_fd,
+                        )
+                        break
+                    except FileExistsError:
+                        name = f"{stamp}-{plan.operation}-{safe_base}-{secrets.token_hex(4)}.patch"
+                if descriptor is None:
+                    raise MutationError("io_error", "cannot allocate a unique patch export name")
+                _write_all(descriptor, patch_text.encode("utf-8"))
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+                os.fsync(exports_fd)
+            except MutationError:
+                raise
+            except OSError as error:
+                raise MutationError(
+                    "io_error", f"patch export failed: {error.strerror or error}"
+                ) from error
+            finally:
+                if descriptor is not None:
+                    with suppress(OSError):
+                        os.close(descriptor)
+    return f"{exports_dir_name}/{name}"

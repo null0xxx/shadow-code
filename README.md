@@ -124,8 +124,14 @@ Cooperating Shadow Code writers serialize their commits on a per-workspace lock
 Shadow Code writers that voluntarily take it and is **not a security boundary** — it
 offers no protection against uncooperative or hostile processes.
 
-Strict mode withholds the filesystem-write capability entirely, so policy denies
-`write_file`/`edit_file` with `CAPABILITY_NOT_GRANTED` while reads keep working:
+Strict mode refuses direct application entirely — because no enforced,
+non-movable workspace ancestry primitive is adopted (roadmap D-014), no
+atomic guarantee against a hostile final-window swap is claimed. Instead of
+denying the capability, strict mode keeps `write_file`/`edit_file` available
+but routes every approved change to a **patch export**: the full unified diff
+is written to `<workspace>/.shadow-code-exports/` and reported with status
+`exported`. The workspace target is never touched on this path — the export
+is a reviewed-patch fallback, not confinement:
 
 ```bash
 SHADOW_MUTATION_STRICT=1 .venv/bin/shadow-code
@@ -210,7 +216,7 @@ and text responses, but commands that require file or shell tools cannot execute
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API URL |
 | `SHADOW_LEGACY_MARKDOWN_TOOLS` | disabled | Opt in to the unsafe compatibility tool path |
 | `SHADOW_BASH_STRICT` | disabled | Deny shell execution when no kernel sandbox is available |
-| `SHADOW_MUTATION_STRICT` | disabled | Withhold the filesystem-write capability entirely |
+| `SHADOW_MUTATION_STRICT` | disabled | Export approved file changes as reviewed patches under `.shadow-code-exports/`, never apply them |
 
 ## Architecture
 

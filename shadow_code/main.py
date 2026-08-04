@@ -111,16 +111,15 @@ def _legacy_markdown_protocol_error(
     )
 
 
-def _granted_capabilities(
-    bash_strict: bool, sandbox_label: str, mutation_strict: bool
-) -> frozenset[Capability]:
-    """Granted capabilities; strict modes withhold shell and file writes.
+def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Capability]:
+    """Granted capabilities; bash strict mode withholds shell execution.
 
     Bash strict mode denies shell execution entirely when no kernel
     sandboxing (bwrap/firejail) is available; the policy engine then rejects
     bash with CAPABILITY_NOT_GRANTED instead of running it unconfined.
-    Mutation strict mode withholds FILESYSTEM_WRITE unconditionally, so
-    write_file/edit_file are denied by policy in the same way.
+    Mutation strict mode keeps FILESYSTEM_WRITE granted: approved changes
+    are exported as reviewed patches instead of being applied, so the
+    capability is still required on the admission path.
     """
     granted = {
         Capability.FILESYSTEM_READ,
@@ -129,8 +128,6 @@ def _granted_capabilities(
     }
     if bash_strict and sandbox_label == "unconfined":
         granted.discard(Capability.PROCESS_EXECUTE)
-    if mutation_strict:
-        granted.discard(Capability.FILESYSTEM_WRITE)
     return frozenset(granted)
 
 
@@ -263,9 +260,12 @@ def _admit_native_calls(
                         )
                     )
                     continue
+                strict_note = (
+                    " [strict: patch export]" if execution_context.mutation_mode == "export" else ""
+                )
                 preview += (
                     f"\nmutation: {mutation_plan.operation} "
-                    f"{mutation_plan.relative_path}\n{mutation_plan.preview}"
+                    f"{mutation_plan.relative_path}{strict_note}\n{mutation_plan.preview}"
                 )
             plan = build_action_plan(
                 validated,
@@ -311,7 +311,8 @@ def main():
     # strict mode withholds the capability when no sandbox is available.
     # write_file/edit_file mutate only after an explicit one-shot approval
     # bound to the exact arguments and previewed diff; mutation strict mode
-    # withholds the FILESYSTEM_WRITE capability entirely.
+    # keeps the capability but exports approved changes as reviewed patches
+    # instead of applying them.
     try:
         workspace_guard = WorkspaceGuard(cwd)
     except WorkspaceAccessError as e:
@@ -320,20 +321,24 @@ def main():
     runtime_registry = ToolRegistry((READ_FILE_SPEC, WRITE_FILE_SPEC, EDIT_FILE_SPEC, BASH_SPEC))
     process_env = build_process_env()
     sandbox_label = detect_sandbox()
-    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label, MUTATION_STRICT)
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
     policy_engine = PolicyEngine(PolicyFacts(capabilities, workspace_guard.identity))
     execution_context = WorkspaceContext(
         guard=workspace_guard,
         workspace_root=cwd,
         process_env=process_env,
         sandbox_label=sandbox_label,
+        mutation_mode="export" if MUTATION_STRICT else "apply",
     )
     if Capability.PROCESS_EXECUTE not in capabilities:
         print("[bash disabled: strict mode and no sandbox (bwrap/firejail) available]")
     else:
         print("[bash runs UNCONFINED; every execution requires explicit approval]")
-    if Capability.FILESYSTEM_WRITE not in capabilities:
-        print("[file mutations disabled: SHADOW_MUTATION_STRICT is set]")
+    if MUTATION_STRICT:
+        print(
+            "[file mutations run in strict mode: changes are exported as "
+            "reviewed patches, never applied]"
+        )
     approval_authority = ApprovalAuthority()
     tool_schemas = render_ollama_tool_schemas(runtime_registry)
     system_prompt = render_system_prompt(
