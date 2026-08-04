@@ -106,24 +106,34 @@ def test_mode_change_before_apply_aborts(
     assert _temp_files(root) == []
 
 
-def test_target_replacement_with_new_inode_aborts(
-    workspace: tuple[Path, WorkspaceGuard],
+def test_identity_change_before_pre_commit_boundary_aborts(
+    workspace: tuple[Path, WorkspaceGuard], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, guard = workspace
     target = root / "swapped.txt"
     target.write_text("identical\n", encoding="utf-8")
     os.chmod(target, 0o644)
-    planned_inode = target.stat().st_ino
     args = _write_args("swapped.txt", "approved\n")
     plan = build_write_plan(guard, args)
 
-    # Replace the target with a new inode holding identical bytes and mode:
-    # the identity half of the snapshot must still catch the swap.
-    target.unlink()
-    target.write_text("identical\n", encoding="utf-8")
-    os.chmod(target, 0o644)
-    assert target.stat().st_ino != planned_inode
+    # Simulate an inode swap holding identical bytes and mode: the identity
+    # half of the snapshot must still catch it. Injected synthetically
+    # because real filesystems may reuse the inode on immediate
+    # unlink+create, which would make the race unobservable.
+    real_snapshot = mutation.snapshot_file
 
+    def swapped(guard: WorkspaceGuard, path: str) -> mutation.FileSnapshot:
+        snap = real_snapshot(guard, path)
+        return mutation.FileSnapshot(
+            exists=snap.exists,
+            device=snap.device,
+            inode=(snap.inode or 0) + 1,
+            mode=snap.mode,
+            size=snap.size,
+            sha256=snap.sha256,
+        )
+
+    monkeypatch.setattr(mutation, "snapshot_file", swapped)
     with pytest.raises(MutationError) as caught:
         apply_mutation(guard, plan, args.content.encode("utf-8"))
 
