@@ -240,9 +240,76 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertIn("## bash", prompts[0])
             self.assertNotIn("native_tools_unavailable", stdout.getvalue())
 
+    def test_strict_mode_denies_unconfined_bash_but_allows_read_file(self):
+        import importlib
+        import tempfile
+
+        from shadow_code.conversation import Conversation
+        from shadow_code.policy.workspace import WorkspaceGuard
+
+        main_module = importlib.import_module("shadow_code.main")
+        native_calls = [
+            {"call_id": "call-0", "name": "read_file", "arguments": {"file_path": "hello.txt"}},
+            {"call_id": "call-1", "name": "bash", "arguments": {"command": "echo ok"}},
+        ]
+
+        with tempfile.TemporaryDirectory() as workspace:
+            with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
+                handle.write("strict content\n")
+
+            client = MagicMock()
+            client.health_check.return_value = (True, "OK")
+            client.last_prompt_tokens = 0
+            client.last_eval_tokens = 0
+            responses = iter((([], native_calls), (["finished"], [])))
+
+            def chat_stream(messages, system, model=None, tools=None):
+                chunks, client.last_tool_calls = next(responses)
+                return iter(chunks)
+
+            client.chat_stream.side_effect = chat_stream
+            conversation = Conversation()
+
+            with (
+                patch.object(main_module, "_RICH", False),
+                patch.object(main_module, "_HAS_REPL", False),
+                patch.object(main_module, "_HAS_DB", False),
+                patch.object(main_module, "BASH_STRICT", True),
+                patch.object(main_module, "detect_sandbox", return_value="unconfined"),
+                patch.object(main_module, "OllamaClient", return_value=client),
+                patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(
+                    main_module,
+                    "WorkspaceGuard",
+                    side_effect=lambda root, **kw: WorkspaceGuard(workspace),
+                ),
+                patch.object(main_module, "_register_optional_tools"),
+                patch.object(main_module.tool_reg, "register"),
+                patch.object(main_module.signal, "signal"),
+                patch("builtins.input", side_effect=["run both", "/exit"]),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                main_module.main()
+
+            tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 2)
+            read_message = next(m for m in tool_messages if m["name"] == "read_file")
+            bash_message = next(m for m in tool_messages if m["name"] == "bash")
+            self.assertIn("strict content", read_message["content"])
+            self.assertIn("policy_denied", bash_message["content"])
+            self.assertIn("bash disabled: strict mode", stdout.getvalue())
+
 
 class TestAdmitNativeCalls(unittest.TestCase):
     """The admission pipeline fails closed without executing handlers."""
+
+    @staticmethod
+    def _deny_and_capture(plans):
+        def deny(plan):
+            plans.append(plan)
+            return False
+
+        return deny
 
     def test_bash_unknown_and_malformed_calls_never_execute(self):
         import tempfile
@@ -293,10 +360,16 @@ class TestAdmitNativeCalls(unittest.TestCase):
         registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
         capabilities = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
         engine = PolicyEngine(PolicyFacts(capabilities, guard.identity))
-        calls = [{"call_id": "b1", "name": "bash", "arguments": {"command": "id"}}]
-        return workspace, guard, calls, registry, engine, WorkspaceContext(guard)
+        calls = [{"call_id": "b1", "name": "bash", "arguments": {"command": "echo ok"}}]
+        context = WorkspaceContext(
+            guard=guard,
+            workspace_root=workspace.name,
+            process_env={},
+            sandbox_label="unconfined",
+        )
+        return workspace, guard, calls, registry, engine, context
 
-    def test_approved_side_effecting_call_reaches_executor_without_handler(self):
+    def test_approved_side_effecting_call_executes(self):
         from shadow_code.domain.approval import ApprovalAuthority
         from shadow_code.main import _admit_native_calls
 
@@ -304,11 +377,80 @@ class TestAdmitNativeCalls(unittest.TestCase):
         with workspace, guard, patch("builtins.input", return_value="y"):
             results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
 
-        # Approved: the one-shot token is consumed by the executor; bash has
-        # no handler yet, so the typed handler_unavailable result is returned.
+        # Approved: the one-shot token is consumed by the executor and the
+        # unconfined command runs in the workspace.
         self.assertEqual(len(results), 1)
-        self.assertFalse(results[0].success)
-        self.assertEqual(results[0].error.code, "handler_unavailable")
+        self.assertTrue(results[0].success)
+        self.assertIn("$ echo ok", results[0].output)
+        self.assertIn("\nok\n", results[0].output)
+        self.assertIn("exit code: 0", results[0].output)
+
+    def test_approval_plan_binds_execution_facts_for_bash(self):
+        import json
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, calls, registry, engine, context = self._bash_admission()
+        plans = []
+        with (
+            workspace,
+            guard,
+            patch(
+                "shadow_code.main._request_approval",
+                side_effect=self._deny_and_capture(plans),
+            ),
+        ):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        self.assertEqual(results[0].error.code, "approval_denied")
+        self.assertEqual(len(plans), 1)
+        plan = plans[0]
+        facts = json.loads(plan.execution_facts)
+        self.assertEqual(facts["cwd"], workspace.name)
+        self.assertEqual(facts["sandbox"], "unconfined")
+        self.assertTrue(facts["shell"])
+        self.assertEqual(len(facts["env_digest"]), 64)
+        self.assertIn("sandbox: unconfined", plan.preview)
+        self.assertIn("features: none detected", plan.preview)
+
+    def test_approval_plan_classifies_command_features(self):
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, calls, registry, engine, context = self._bash_admission()
+        calls[0]["arguments"]["command"] = "cat $(ls) > out.txt && echo done"
+        plans = []
+        with (
+            workspace,
+            guard,
+            patch(
+                "shadow_code.main._request_approval",
+                side_effect=self._deny_and_capture(plans),
+            ),
+        ):
+            _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        self.assertIn("substitution", plans[0].preview)
+        self.assertIn("redirection", plans[0].preview)
+        self.assertIn("chain", plans[0].preview)
+
+    def test_read_file_plan_keeps_empty_execution_facts(self):
+        from shadow_code.domain.approval import build_action_plan, render_action_preview
+        from shadow_code.domain.policy import WorkspaceIdentity
+        from shadow_code.tools.catalog import DEFAULT_TOOL_REGISTRY
+
+        validated = DEFAULT_TOOL_REGISTRY.validate_call(
+            {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "a.txt"}}
+        )
+        plan = build_action_plan(
+            validated,
+            registry_digest="digest",
+            workspace=WorkspaceIdentity(device=1, inode=2),
+            preview=render_action_preview(validated),
+        )
+
+        self.assertEqual(plan.execution_facts, "")
 
     def test_denied_side_effecting_call_is_final_and_not_retried(self):
         from shadow_code.domain.approval import ApprovalAuthority

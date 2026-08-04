@@ -19,6 +19,7 @@ from datetime import datetime
 
 from . import tools as tool_reg
 from .config import (
+    BASH_STRICT,
     CONTEXT_WINDOW,
     LEGACY_MARKDOWN_TOOLS,
     MAX_CONSECUTIVE_ERRORS,
@@ -41,6 +42,7 @@ from .ollama_client import OllamaClient, render_ollama_tool_schemas
 from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
 from .policy.engine import PolicyEngine
 from .policy.workspace import WorkspaceGuard
+from .process import build_process_env, classify_command, detect_sandbox, execution_facts
 from .prompt import render_system_prompt, render_tool_documentation
 from .safety import check_destructive
 from .skills import get_skill, list_skills
@@ -94,6 +96,19 @@ def _legacy_markdown_protocol_error(
         code="protocol_mismatch",
         message="Legacy Markdown tool calls are disabled; no action was executed.",
     )
+
+
+def _granted_capabilities(strict: bool, sandbox_label: str) -> frozenset[Capability]:
+    """Granted capabilities; strict mode withholds shell without a sandbox.
+
+    Strict mode denies shell execution entirely when no kernel sandboxing
+    (bwrap/firejail) is available; the policy engine then rejects bash with
+    CAPABILITY_NOT_GRANTED instead of running it unconfined.
+    """
+    granted = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
+    if strict and sandbox_label == "unconfined":
+        granted.discard(Capability.PROCESS_EXECUTE)
+    return frozenset(granted)
 
 
 def _request_approval(plan: ActionPlan) -> bool:
@@ -161,11 +176,34 @@ def _admit_native_calls(
                 )
             )
         else:
+            preview = render_action_preview(validated)
+            facts = ""
+            if validated.spec.capability is Capability.PROCESS_EXECUTE:
+                facts = execution_facts(
+                    execution_context.process_env,
+                    execution_context.workspace_root,
+                    execution_context.sandbox_label,
+                )
+                command = str(validated.arguments.get("command", ""))
+                features = sorted(classify_command(command))
+                sandbox_label = execution_context.sandbox_label
+                if sandbox_label == "unconfined":
+                    sandbox_line = "sandbox: unconfined (no sandbox helper available)"
+                else:
+                    sandbox_line = (
+                        f"sandbox: unconfined ({sandbox_label} available but not applied)"
+                    )
+                preview += (
+                    f"\n{sandbox_line}"
+                    f" (no confinement; approval is the only control)"
+                    f"\nfeatures: {', '.join(features) if features else 'none detected'}"
+                )
             plan = build_action_plan(
                 validated,
                 registry_digest=registry.digest,
                 workspace=execution_context.guard.identity,
-                preview=render_action_preview(validated),
+                preview=preview,
+                execution_facts=facts,
             )
             if not _request_approval(plan):
                 results.append(
@@ -199,21 +237,29 @@ def main():
     ctx = ToolContext(cwd)
 
     # Admission: containment guard, policy facts, runtime registry.
-    # bash is advertised but declaration-only: policy requires approval and
-    # the executor reports handler_unavailable until WU-03 lands.
+    # bash executes UNCONFINED after an explicit one-shot approval bound to
+    # the exact command, workspace, environment digest, and sandbox facts;
+    # strict mode withholds the capability when no sandbox is available.
     try:
         workspace_guard = WorkspaceGuard(cwd)
     except WorkspaceAccessError as e:
         print(f"Error: cannot establish workspace containment: {e}", file=sys.stderr)
         sys.exit(1)
     runtime_registry = ToolRegistry((READ_FILE_SPEC, BASH_SPEC))
-    policy_engine = PolicyEngine(
-        PolicyFacts(
-            {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE},
-            workspace_guard.identity,
-        )
+    process_env = build_process_env()
+    sandbox_label = detect_sandbox()
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
+    policy_engine = PolicyEngine(PolicyFacts(capabilities, workspace_guard.identity))
+    execution_context = WorkspaceContext(
+        guard=workspace_guard,
+        workspace_root=cwd,
+        process_env=process_env,
+        sandbox_label=sandbox_label,
     )
-    execution_context = WorkspaceContext(guard=workspace_guard)
+    if Capability.PROCESS_EXECUTE not in capabilities:
+        print("[bash disabled: strict mode and no sandbox (bwrap/firejail) available]")
+    else:
+        print("[bash runs UNCONFINED; every execution requires explicit approval]")
     approval_authority = ApprovalAuthority()
     tool_schemas = render_ollama_tool_schemas(runtime_registry)
     system_prompt = render_system_prompt(
