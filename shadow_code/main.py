@@ -741,7 +741,7 @@ def main():
         print(f"[events warning: {e}]")
         event_store = None
 
-    print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt\n")
+    print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt /events\n")
 
     conv = Conversation()
     interrupted = False

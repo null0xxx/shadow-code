@@ -2,14 +2,27 @@
 #
 # Supports both streaming text and native tool calling (Gemma 4+).
 # Tracks prompt_eval_count and eval_count for context management.
+# Streaming itself lives in provider.py; this client is a thin sync adapter
+# that preserves the historical chat_stream/last_tool_calls surface.
 
 import json
+from collections.abc import Mapping
 from contextlib import suppress
 from typing import Any
 
 import requests
 
 from .config import MODEL_NAME, MODEL_OPTIONS, OLLAMA_BASE_URL
+from .provider import (
+    OllamaProvider,
+    ProviderError,
+    ProviderStreamError,
+    TextDelta,
+    ToolCallComplete,
+    UsageUpdate,
+    iter_events_sync,
+    thaw_arguments,
+)
 from .tools.projections import flat_tool_schema
 from .tools.registry import ToolRegistry
 
@@ -208,8 +221,10 @@ TOOL_SCHEMAS = [
 
 
 def _normalize_tool_call(raw: object, fallback_id: str) -> dict[str, Any]:
-    """Normalize a provider tool-call envelope into registry input shape.
+    """Compatibility shim: normalize one provider tool-call envelope.
 
+    The streaming path normalizes inside StreamAssembler (provider.py);
+    this helper keeps the historical single-call shape for importers.
     Malformed payloads are kept as structured data (never executed); the
     registry's validate_call fails closed on them downstream.
     """
@@ -240,6 +255,7 @@ class OllamaClient:
         self.last_prompt_tokens: int = 0
         self.last_eval_tokens: int = 0
         self.last_tool_calls: list[dict] = []
+        self._provider = OllamaProvider(OLLAMA_BASE_URL, MODEL_OPTIONS)
 
     def health_check(self) -> tuple[bool, str]:
         """Verify Ollama is running and model is available."""
@@ -267,49 +283,35 @@ class OllamaClient:
     ):
         """Stream text and collect native tool calls for the admission pipeline.
 
+        Thin sync adapter over provider.py: the typed event stream is the
+        single streaming implementation; this method only projects it onto
+        the historical text-chunk/last_tool_calls surface.
+
         Yields:
             str: Text content chunks.
         """
         self.last_tool_calls = []
 
-        payload: dict = {
-            "model": model or MODEL_NAME,
-            "messages": [{"role": "system", "content": system}] + messages,
-            "stream": True,
-            "options": MODEL_OPTIONS,
-        }
-        if tools is not None:
-            payload["tools"] = tools
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json=payload,
-            stream=True,
-            timeout=600,
-        )
-        resp.raise_for_status()
-
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            # Text content
-            content = data.get("message", {}).get("content", "")
-            if content:
-                yield content
-
-            # Native tool calls: collected (normalized), never executed here
-            tool_calls = data.get("message", {}).get("tool_calls", [])
-            for raw_call in tool_calls:
-                fallback_id = f"call-{len(self.last_tool_calls)}"
-                self.last_tool_calls.append(_normalize_tool_call(raw_call, fallback_id))
-
-            if data.get("done"):
-                self.last_prompt_tokens = data.get("prompt_eval_count", 0)
-                self.last_eval_tokens = data.get("eval_count", 0)
+        events = self._provider.stream(messages, system, model or MODEL_NAME, tools)
+        for event in iter_events_sync(events):
+            if isinstance(event, TextDelta):
+                yield event.text
+            elif isinstance(event, ToolCallComplete):
+                arguments = event.arguments
+                self.last_tool_calls.append(
+                    {
+                        "call_id": event.call_id,
+                        "name": event.name,
+                        "arguments": thaw_arguments(arguments)
+                        if isinstance(arguments, Mapping)
+                        else arguments,
+                    }
+                )
+            elif isinstance(event, UsageUpdate):
+                self.last_prompt_tokens = event.prompt_tokens
+                self.last_eval_tokens = event.eval_tokens
+            elif isinstance(event, ProviderError):
+                raise ProviderStreamError(event)
 
     def format_tool_result_message(self, tool_name: str, output: str) -> dict:
         """Format a tool result as an Ollama tool message."""

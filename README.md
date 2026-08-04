@@ -289,7 +289,8 @@ shadow-code/
     main.py           Entry point, REPL, context management
     prompt.py          System prompt (Claude Code adapted, 17K chars)
     parser.py          Legacy Markdown tool call detection
-    ollama_client.py   Ollama API streaming client
+    provider.py        Provider-neutral typed streaming contract
+    ollama_client.py   Ollama API streaming client (thin adapter over provider.py)
     conversation.py    Message history, 3-tier context management
     display.py         Streaming buffer (hides tool JSON from user)
     compaction.py      LLM-based conversation summarization
@@ -317,6 +318,26 @@ shadow-code/
 3. **Legacy tool calling** uses ` ```tool_call ` Markdown only when explicitly enabled
 4. **Context management** follows Claude Code's pattern: clear old results at 55%, LLM summarization at 65%, emergency truncate at 85%
 5. **KV cache** optimization: system prompt is 100% static for Ollama cache hits
+
+## Provider Contract
+
+`provider.py` turns Ollama's NDJSON stream into one typed event stream —
+`TextDelta`, `ToolCallStarted`, `ToolCallArgumentsDelta`, `ToolCallComplete`,
+`UsageUpdate`, `TurnDone`, `ProviderError` — independent of UI and engine.
+Raw provider dictionaries never leave the module.
+
+- **Fail-closed normalization:** fragmented argument strings accumulate per
+  call and parse only when the call completes; unparseable arguments are
+  carried raw so registry validation rejects them. Partial calls never execute.
+- **Order and identity:** calls keep provider IDs (generated `call-<n>` when
+  missing) and complete in stream order.
+- **Typed errors:** HTTP failures, timeouts, disconnects, and malformed
+  payloads terminate the stream with a coded `ProviderError`.
+- **Cancellation and timeouts:** closing the stream closes the HTTP response
+  and stops the reader thread; connect/read timeouts are configurable.
+
+`ollama_client.py` is a thin sync adapter over this contract; its public
+surface (`chat_stream`, `last_tool_calls`, token tracking) is unchanged.
 
 ## License
 
