@@ -1,5 +1,6 @@
 """Strict tool contracts shared by providers, policy, and executors."""
 
+import json
 from collections.abc import Callable, Mapping
 from enum import Enum
 from types import MappingProxyType
@@ -128,6 +129,15 @@ class ValidatedToolCall(FrozenModel):
     call: ToolCall
     spec: ToolSpec
     arguments: FrozenArguments
+
+    def canonical_arguments_json(self) -> str:
+        """Serialize the validated arguments as deterministic canonical JSON."""
+        return json.dumps(
+            _thaw(self.arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @model_validator(mode="before")
     @classmethod
