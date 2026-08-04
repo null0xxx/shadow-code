@@ -231,9 +231,8 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertEqual(len(payloads), 2)
             for tools in payloads:
                 self.assertIsNotNone(tools)
-                self.assertEqual(
-                    [t["function"]["name"] for t in tools], ["bash", "read_file"]
-                )
+                names = [t["function"]["name"] for t in tools]
+                self.assertEqual(names, ["bash", "read_file"])
 
             # System prompt uses the native section plus generated tool docs.
             self.assertNotIn("No executable tool protocol is active", prompts[0])
