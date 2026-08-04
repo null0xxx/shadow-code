@@ -42,6 +42,7 @@ _SLASH_COMMANDS = [
     "/history",
     "/cd",
     "/prompt",
+    "/events",
 ]
 
 # prompt_toolkit style

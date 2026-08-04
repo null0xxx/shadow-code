@@ -190,6 +190,28 @@ A rollback is verified against stored bytes and the live registry before activat
 anything fails, the active prompt stays unchanged. Rollback pins the snapshot for the
 rest of the session — the next startup recompiles from whatever sources exist then.
 
+### Event store and resume
+
+Every causal action of a turn is appended to an append-only event log at
+`~/.local/state/shadow-code/events.db` (SQLite, WAL). Recorded events: session start and
+end, user and assistant messages, each proposed tool call, the policy decision, approval
+requests/grants/denials bound to the action-plan digest, the terminal tool result, and a
+per-turn `turn_completed` carrying the active prompt snapshot digest. Causally linked
+events land in a single transaction, duplicate appends are idempotent, and there is no
+update or delete API.
+
+On startup, if the most recent session has proposed calls with no terminal result, the
+CLI prints the pending call ids, tool names, and plan digests and asks before continuing:
+continuing abandons the pending work and starts a fresh session — nothing is ever
+re-executed on resume. `/events` runs integrity diagnostics for the current session
+(sequence contiguity, payload versions, call-id references). The event store never
+breaks the CLI: if it cannot be opened or written, a warning is printed and the session
+continues without events.
+
+Legacy sessions from `~/.shadow-code/sessions.db` are never migrated. To audit one
+through the event store, call `EventStore.import_legacy_session(path, session_id)` —
+it copies the messages read-only into a `legacy-<id>` event session and is idempotent.
+
 ## Features
 
 | Feature | Description |
@@ -217,6 +239,7 @@ rest of the session — the next startup recompiles from whatever sources exist 
 /list          List saved sessions
 /skills        List available skills
 /prompt        Inspect, reload, and roll back the system prompt
+/events        Verify event store integrity
 /version       Version info
 /exit          Exit
 ```

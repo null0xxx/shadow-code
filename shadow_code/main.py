@@ -19,6 +19,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import uuid
 from datetime import datetime
 
 from pydantic import ValidationError
@@ -44,6 +45,23 @@ from .domain.approval import (
 )
 from .domain.policy import PolicyDisposition, PolicyFacts, WorkspaceAccessError
 from .domain.tools import Capability, ToolError, ToolResult, ValidatedToolCall
+from .events import (
+    ApprovalDeniedPayload,
+    ApprovalGrantedPayload,
+    ApprovalRequestedPayload,
+    AssistantTextPayload,
+    EventStore,
+    EventStoreError,
+    NewEvent,
+    PolicyDecisionPayload,
+    SessionEndedPayload,
+    SessionStartedPayload,
+    ToolCallProposedPayload,
+    ToolResultPayload,
+    TurnCompletedPayload,
+    UserMessagePayload,
+    default_events_db_path,
+)
 from .executor import execute_validated_call
 from .mutation import MutationError, MutationPlan, build_edit_plan, build_write_plan
 from .ollama_client import OllamaClient, render_ollama_tool_schemas
@@ -192,12 +210,113 @@ def _request_approval(plan: ActionPlan) -> bool:
     return answer == "y"
 
 
+def _canonical_json(value: object) -> str:
+    """Serialize tool-call arguments deterministically; tolerate odd values."""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _emit(store: EventStore | None, session_id: str, events: list[NewEvent]) -> None:
+    """Append events; a store failure degrades to a warning, never a crash."""
+    if store is None or not events:
+        return
+    try:
+        if len(events) == 1:
+            store.append(session_id, events[0])
+        else:
+            store.append_group(session_id, events)
+    except (EventStoreError, OSError) as e:
+        print(f"[events warning: {e}]")
+
+
+def _proposal_events(native_calls: list[dict]) -> list[NewEvent]:
+    """One tool_call_proposed event per raw call, in proposal order."""
+    events = []
+    for raw_call in native_calls:
+        if isinstance(raw_call, dict):
+            call_id = str(raw_call.get("call_id") or "invalid-call")
+            name = str(raw_call.get("name") or "unknown")
+            arguments = raw_call.get("arguments")
+        else:
+            call_id, name, arguments = "invalid-call", "unknown", None
+        events.append(
+            NewEvent(
+                "tool_call_proposed",
+                ToolCallProposedPayload(
+                    call_id=call_id,
+                    name=name,
+                    arguments_json=_canonical_json(arguments),
+                ),
+            )
+        )
+    return events
+
+
+def _result_event(result: ToolResult) -> NewEvent:
+    """The terminal tool_result event for an admission outcome."""
+    return NewEvent(
+        "tool_result",
+        ToolResultPayload(
+            call_id=result.call_id,
+            tool_name=result.tool_name,
+            ok=result.success,
+            output=result.output,
+            error_code=result.error.code if result.error else None,
+            error_message=result.error.message if result.error else None,
+        ),
+    )
+
+
+def _decision_event(call_id: str, disposition: str, reason: str) -> NewEvent:
+    return NewEvent(
+        "policy_decision",
+        PolicyDecisionPayload(call_id=call_id, disposition=disposition, reason=reason),
+    )
+
+
+def _resolve_pending_events(store: EventStore) -> bool:
+    """Report unfinished calls from the most recent event session.
+
+    Fail closed: pending work is NEVER re-executed. The user either
+    acknowledges and abandons it (fresh session) or leaves. Returns True to
+    continue startup, False to exit before any new session starts.
+    """
+    previous = store.latest_session_id()
+    if previous is None:
+        return True
+    pending = store.pending_tool_calls(previous)
+    if not pending:
+        return True
+    print(
+        f"[events] previous session {previous[:12]} interrupted with "
+        f"{len(pending)} unfinished tool call(s):"
+    )
+    for call in pending:
+        plan = f"  plan={call.plan_digest[:12]}..." if call.plan_digest else ""
+        print(f"  {call.call_id}  {call.name}{plan}")
+    print("[events] nothing will be re-executed; continuing abandons the pending calls.")
+    try:
+        answer = input("Abandon pending calls and start a fresh session? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer.strip().lower() == "y":
+        return True
+    print("[events] leaving; the pending record stays in the event store.")
+    return False
+
+
 def _admit_native_calls(
     native_calls: list[dict],
     registry: ToolRegistry,
     policy_engine: PolicyEngine,
     execution_context: WorkspaceContext,
     approval_authority: ApprovalAuthority,
+    *,
+    event_store: EventStore | None = None,
+    event_session_id: str = "",
 ) -> list[ToolResult]:
     """Run collected native calls through validate -> policy -> execute.
 
@@ -205,6 +324,12 @@ def _admit_native_calls(
     policy denials produce typed error results and never reach a handler.
     Approval-required calls ask interactively for a one-shot, digest-bound
     token; denial or cancellation is final and the call is not retried.
+
+    When an event store is attached, every causal step is appended:
+    policy decisions, approval requests/grants/denials, and the terminal
+    result. Terminal groups (denial + result, grant + result) append
+    atomically; an allow decision and its result append separately so a
+    crash between them stays detectable as pending on resume.
     """
     results = []
     for raw_call in native_calls:
@@ -212,29 +337,44 @@ def _admit_native_calls(
         if isinstance(validated, ToolError):
             fallback_id = raw_call.get("call_id") if isinstance(raw_call, dict) else None
             fallback_name = raw_call.get("name") if isinstance(raw_call, dict) else None
-            results.append(
-                ToolResult(
-                    call_id=fallback_id or "invalid-call",
-                    tool_name=fallback_name or "unknown",
-                    error=validated,
-                )
+            result = ToolResult(
+                call_id=fallback_id or "invalid-call",
+                tool_name=fallback_name or "unknown",
+                error=validated,
             )
+            _emit(event_store, event_session_id, [_result_event(result)])
+            results.append(result)
             continue
 
+        call_id = validated.call.call_id
         decision = policy_engine.decide(validated)
         if decision.disposition is PolicyDisposition.ALLOW:
-            results.append(execute_validated_call(validated, execution_context))
-        elif decision.disposition is PolicyDisposition.DENY:
-            results.append(
-                ToolResult(
-                    call_id=validated.call.call_id,
-                    tool_name=validated.call.name,
-                    error=ToolError(
-                        code="policy_denied",
-                        message=f"Policy denied execution ({decision.reason.value}).",
-                    ),
-                )
+            _emit(
+                event_store,
+                event_session_id,
+                [_decision_event(call_id, "allow", decision.reason.value)],
             )
+            result = execute_validated_call(validated, execution_context)
+            _emit(event_store, event_session_id, [_result_event(result)])
+            results.append(result)
+        elif decision.disposition is PolicyDisposition.DENY:
+            result = ToolResult(
+                call_id=call_id,
+                tool_name=validated.call.name,
+                error=ToolError(
+                    code="policy_denied",
+                    message=f"Policy denied execution ({decision.reason.value}).",
+                ),
+            )
+            _emit(
+                event_store,
+                event_session_id,
+                [
+                    _decision_event(call_id, "deny", decision.reason.value),
+                    _result_event(result),
+                ],
+            )
+            results.append(result)
         else:
             preview = render_action_preview(validated)
             facts = ""
@@ -263,13 +403,13 @@ def _admit_native_calls(
                 if isinstance(mutation_plan, ToolError):
                     # Plan-build failures (no_match, ambiguous_match, ...)
                     # surface as typed results, never as approval prompts.
-                    results.append(
-                        ToolResult(
-                            call_id=validated.call.call_id,
-                            tool_name=validated.call.name,
-                            error=mutation_plan,
-                        )
+                    result = ToolResult(
+                        call_id=call_id,
+                        tool_name=validated.call.name,
+                        error=mutation_plan,
                     )
+                    _emit(event_store, event_session_id, [_result_event(result)])
+                    results.append(result)
                     continue
                 strict_note = (
                     " [strict: patch export]" if execution_context.mutation_mode == "export" else ""
@@ -285,38 +425,72 @@ def _admit_native_calls(
                 preview=preview,
                 execution_facts=facts,
             )
-            if not _request_approval(plan):
-                results.append(
-                    ToolResult(
-                        call_id=validated.call.call_id,
-                        tool_name=validated.call.name,
-                        error=ToolError(
-                            code="approval_denied",
-                            message=(
-                                "User denied or cancelled the approval; the call was not executed."
-                            ),
+            plan_digest = plan.digest()
+            _emit(
+                event_store,
+                event_session_id,
+                [
+                    _decision_event(call_id, "require_approval", decision.reason.value),
+                    NewEvent(
+                        "approval_requested",
+                        ApprovalRequestedPayload(
+                            call_id=call_id, plan_digest=plan_digest, preview=preview
                         ),
-                    )
+                    ),
+                ],
+            )
+            if not _request_approval(plan):
+                result = ToolResult(
+                    call_id=call_id,
+                    tool_name=validated.call.name,
+                    error=ToolError(
+                        code="approval_denied",
+                        message=(
+                            "User denied or cancelled the approval; the call was not executed."
+                        ),
+                    ),
                 )
+                _emit(
+                    event_store,
+                    event_session_id,
+                    [
+                        NewEvent(
+                            "approval_denied",
+                            ApprovalDeniedPayload(call_id=call_id, plan_digest=plan_digest),
+                        ),
+                        _result_event(result),
+                    ],
+                )
+                results.append(result)
                 continue
             token = approval_authority.issue(plan)
-            results.append(
-                execute_validated_call(
-                    validated,
-                    execution_context,
-                    approval=token,
-                    authority=approval_authority,
-                    plan=plan,
-                )
+            result = execute_validated_call(
+                validated,
+                execution_context,
+                approval=token,
+                authority=approval_authority,
+                plan=plan,
             )
+            _emit(
+                event_store,
+                event_session_id,
+                [
+                    NewEvent(
+                        "approval_granted",
+                        ApprovalGrantedPayload(call_id=call_id, plan_digest=plan_digest),
+                    ),
+                    _result_event(result),
+                ],
+            )
+            results.append(result)
     return results
 
 
 def _report_prompt_switch(compiled: CompiledPrompt, previous: str | None) -> None:
     """Print the snapshot attribution line and, on a switch, the audit line.
 
-    WU-04: the audit trail is this printed line plus the snapshot history;
-    the durable event store arrives with WU-06.
+    The active snapshot digest is also recorded per turn in the event
+    store (turn_completed, WU-06).
     """
     print(f"prompt snapshot: {compiled.digest[:12]}")
     if previous:
@@ -538,6 +712,35 @@ def main():
             print(f"[DB warning: {e}]")
             db = None
 
+    # Event store (WU-06): append-only causal authority for resume and
+    # audit. Any failure downgrades to a warning -- the store must never
+    # break the CLI. A previous session's unfinished calls are reported and
+    # abandoned only with explicit acknowledgment; nothing is re-executed.
+    event_store = None
+    event_session_id = ""
+    try:
+        event_store = EventStore(default_events_db_path())
+        if not _resolve_pending_events(event_store):
+            event_store.close()
+            workspace_guard.close()
+            if db:
+                db.close()
+            return
+        event_session_id = uuid.uuid4().hex
+        _emit(
+            event_store,
+            event_session_id,
+            [
+                NewEvent(
+                    "session_started",
+                    SessionStartedPayload(model=MODEL_NAME, cwd=cwd),
+                )
+            ],
+        )
+    except (EventStoreError, OSError) as e:
+        print(f"[events warning: {e}]")
+        event_store = None
+
     print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt\n")
 
     conv = Conversation()
@@ -664,6 +867,7 @@ def main():
                 ("/list", "List saved sessions"),
                 ("/skills", "List available skills"),
                 ("/prompt <sub>", "Inspect/reload/rollback the system prompt"),
+                ("/events", "Verify event store integrity"),
             ]
             # Add skills
             for skill_name, skill_desc in list_skills():
@@ -745,6 +949,20 @@ def main():
                 print("  [DB not available]")
             continue
 
+        if user_input == "/events":
+            if event_store is not None:
+                issues = event_store.verify(event_session_id)
+                count = len(event_store.events_for(event_session_id))
+                if issues:
+                    print(f"  event store: {len(issues)} issue(s) across {count} events")
+                    for issue in issues:
+                        print(f"  issue: {issue}")
+                else:
+                    print(f"  event store OK: {count} events, integrity verified")
+            else:
+                print("  [event store not available]")
+            continue
+
         if user_input.startswith("/prompt"):
             _handle_prompt_command(user_input, prompt_manager)
             continue
@@ -807,9 +1025,17 @@ def main():
                         pass
                     break
             conv.add_user(env_prefix + user_input)
+            user_content = env_prefix + user_input
             first_message = False
         else:
             conv.add_user(user_input)
+            user_content = user_input
+
+        _emit(
+            event_store,
+            event_session_id,
+            [NewEvent("user_message", UserMessagePayload(content=user_content))],
+        )
 
         # Save to DB
         if db:
@@ -868,12 +1094,15 @@ def main():
             native_calls = list(getattr(client, "last_tool_calls", []))
             if native_calls:
                 conv.add_assistant_tool_call(native_calls)
+                _emit(event_store, event_session_id, _proposal_events(native_calls))
                 results = _admit_native_calls(
                     native_calls,
                     runtime_registry,
                     policy_engine,
                     execution_context,
                     approval_authority,
+                    event_store=event_store,
+                    event_session_id=event_session_id,
                 )
                 for result in results:
                     if result.success:
@@ -893,6 +1122,11 @@ def main():
             # No native tool calls -- check for text response
             if resp and resp.strip():
                 conv.add_assistant(resp)
+                _emit(
+                    event_store,
+                    event_session_id,
+                    [NewEvent("assistant_text", AssistantTextPayload(content=resp))],
+                )
                 if db:
                     db.add_message(session_id, "assistant", resp)
                     db.update_session_tokens(session_id, conv.total_prompt_tokens)
@@ -947,6 +1181,18 @@ def main():
         if turns >= MAX_TOOL_TURNS:
             print(f"[Tool limit ({MAX_TOOL_TURNS}) reached]")
 
+        # Record the active prompt snapshot digest for this completed turn.
+        _emit(
+            event_store,
+            event_session_id,
+            [
+                NewEvent(
+                    "turn_completed",
+                    TurnCompletedPayload(prompt_digest=prompt_manager.active.digest),
+                )
+            ],
+        )
+
         # === Context status (always visible) ===
         conv.update_tokens(client.last_prompt_tokens)
         if conv.total_prompt_tokens > 0:
@@ -978,6 +1224,13 @@ def main():
                 print("[Emergency truncation applied]")
 
     # Cleanup
+    _emit(
+        event_store,
+        event_session_id,
+        [NewEvent("session_ended", SessionEndedPayload(reason="exit"))],
+    )
+    if event_store is not None:
+        event_store.close()
     workspace_guard.close()
     if db:
         db.close()
