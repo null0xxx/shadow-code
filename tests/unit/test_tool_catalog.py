@@ -11,7 +11,9 @@ from shadow_code.domain.tools import (
     ValidatedToolCall,
 )
 from shadow_code.policy.workspace import WorkspaceGuard
+from shadow_code.process import build_process_env
 from shadow_code.tools.catalog import (
+    BASH_OUTPUT_LIMIT,
     BASH_SPEC,
     DEFAULT_TOOL_REGISTRY,
     READ_FILE_OUTPUT_LIMIT,
@@ -19,6 +21,7 @@ from shadow_code.tools.catalog import (
     BashArgs,
     ReadFileArgs,
     WorkspaceContext,
+    _bash_handler,
     _bounded_output,
     _read_file_handler,
 )
@@ -26,7 +29,9 @@ from shadow_code.tools.catalog import (
 
 def test_default_catalog_has_exact_order_and_truthful_metadata() -> None:
     assert DEFAULT_TOOL_REGISTRY.names == ("bash", "read_file")
-    assert BASH_SPEC.handler is None
+    assert BASH_SPEC.handler is _bash_handler
+    assert "UNCONFINED" in BASH_SPEC.description
+    assert "no sandbox" in BASH_SPEC.description
     assert BASH_SPEC.capability is Capability.PROCESS_EXECUTE
     assert BASH_SPEC.risk is RiskLevel.HIGH
     assert BASH_SPEC.side_effects is SideEffect.UNKNOWN
@@ -160,15 +165,115 @@ def test_read_file_handler_normalizes_read_oserror(
     assert "deterministic read failure" in result.error.message
 
 
-def test_bash_is_validatable_but_declaration_only() -> None:
+def test_bash_is_validatable_and_executable() -> None:
     result = DEFAULT_TOOL_REGISTRY.validate_call(
         {"call_id": "bash-1", "name": "bash", "arguments": {"command": "printf ok"}}
     )
 
     assert isinstance(result, ValidatedToolCall)
     assert result.spec is BASH_SPEC
-    assert result.spec.handler is None
+    assert result.spec.handler is _bash_handler
     assert result.model_dump()["arguments"] == BashArgs(command="printf ok").model_dump()
+
+
+def _bash_context(
+    guard: WorkspaceGuard, root: Path, env: dict[str, str] | None = None
+) -> WorkspaceContext:
+    return WorkspaceContext(
+        guard=guard,
+        workspace_root=str(root),
+        process_env={} if env is None else env,
+        sandbox_label="unconfined",
+    )
+
+
+def test_bash_handler_runs_command_in_workspace(tmp_path: Path) -> None:
+    call = ToolCall(call_id="bash-run", name="bash", arguments={"command": "echo ok"})
+    with WorkspaceGuard(tmp_path) as guard:
+        result = _bash_handler(call, BashArgs(command="echo ok"), _bash_context(guard, tmp_path))
+
+    assert result.success is True
+    assert result.call_id == "bash-run"
+    assert result.tool_name == "bash"
+    assert result.output is not None
+    assert result.output.startswith("$ echo ok")
+    assert "\nok\n" in result.output
+    assert "exit code: 0" in result.output
+
+
+def test_bash_handler_reports_non_zero_exit_and_stderr(tmp_path: Path) -> None:
+    command = "echo oops >&2; exit 7"
+    call = ToolCall(call_id="bash-fail", name="bash", arguments={"command": command})
+    with WorkspaceGuard(tmp_path) as guard:
+        result = _bash_handler(call, BashArgs(command=command), _bash_context(guard, tmp_path))
+
+    # A non-zero exit is still a successful tool result: the model needs the output.
+    assert result.success is True
+    assert result.output is not None
+    assert "[stderr]\noops" in result.output
+    assert "exit code: 7" in result.output
+
+
+def test_bash_handler_environment_drops_parent_secrets(tmp_path: Path) -> None:
+    sentinel = "SHADOW_TEST_SECRET_TOKEN"
+    source = {"PATH": "/usr/bin:/bin", sentinel: "sentinel-value"}
+    call = ToolCall(call_id="bash-env", name="bash", arguments={"command": "env"})
+    with WorkspaceGuard(tmp_path) as guard:
+        context = _bash_context(guard, tmp_path, build_process_env(source))
+        result = _bash_handler(call, BashArgs(command="env"), context)
+
+    assert result.success is True
+    assert result.output is not None
+    assert sentinel not in result.output
+    assert "sentinel-value" not in result.output
+
+
+def test_bash_handler_marks_timeout(tmp_path: Path) -> None:
+    command = "sleep 60"
+    call = ToolCall(
+        call_id="bash-timeout",
+        name="bash",
+        arguments={"command": command, "timeout": 1},
+    )
+    with WorkspaceGuard(tmp_path) as guard:
+        context = _bash_context(guard, tmp_path)
+        result = _bash_handler(call, BashArgs(command=command, timeout=1), context)
+
+    assert result.success is True
+    assert result.output is not None
+    assert "timed out after 1s" in result.output
+    assert "exit code: killed" in result.output
+
+
+def test_bash_handler_truncates_and_records_removed_bytes(tmp_path: Path) -> None:
+    command = "head -c 100000 /dev/zero | tr '\\0' a"
+    call = ToolCall(call_id="bash-huge", name="bash", arguments={"command": command})
+    env = build_process_env({"PATH": "/usr/bin:/bin"})
+    with WorkspaceGuard(tmp_path) as guard:
+        result = _bash_handler(call, BashArgs(command=command), _bash_context(guard, tmp_path, env))
+
+    assert result.success is True
+    assert result.output is not None
+    assert "bytes removed" in result.output
+    assert len(result.output) <= BASH_OUTPUT_LIMIT * 4
+
+
+def test_bash_handler_rejects_wrong_arguments_and_context(tmp_path: Path) -> None:
+    call = ToolCall(call_id="bash-contract", name="bash", arguments={"command": "echo ok"})
+
+    wrong_arguments = _bash_handler(call, ReadFileArgs(file_path="x.txt"), object())
+    wrong_context = _bash_handler(call, BashArgs(command="echo ok"), object())
+
+    assert wrong_arguments.error is not None
+    assert wrong_arguments.error.code == "invalid_arguments"
+    assert wrong_context.error is not None
+    assert wrong_context.error.code == "invalid_context"
+
+    # A context without a workspace root cannot execute either.
+    with WorkspaceGuard(tmp_path) as guard:
+        rootless = _bash_handler(call, BashArgs(command="echo ok"), WorkspaceContext(guard))
+    assert rootless.error is not None
+    assert rootless.error.code == "invalid_context"
 
 
 @pytest.mark.parametrize("command", ["", " ", "\t\n"])

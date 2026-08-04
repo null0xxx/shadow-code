@@ -75,8 +75,25 @@ exactly one execution, and is burned by any mismatch — changed arguments, work
 version, or registry reject it. Denial or cancellation is final and the call is not
 retried.
 
-`bash` has no executable handler yet: an approved bash call is admitted and consumes its
-token, then reports `handler_unavailable`. Process execution arrives in a later unit.
+`bash` executes the approved command UNCONFINED — no sandbox is applied, so the
+approval is the only control. The approval plan binds the exact command, the
+workspace, the process-environment digest, the shell resolution, and the sandbox
+facts; the preview visibly labels `sandbox: unconfined` (noting when a sandbox
+helper is detected on the host but not applied, since commands are never wrapped)
+and lists detected shell
+features (substitution, redirection, pipes, chains, backgrounding) before you
+approve. Execution runs in its own process group with a predictable timeout: on
+timeout or cancellation the whole group is terminated, and truncated output
+records how many bytes were removed. The child process receives a minimal
+allowlisted environment (`PATH`, `HOME`, `LANG`, `TERM`, and similar) — parent
+secrets such as API keys and tokens are never passed through.
+
+Strict mode denies shell execution entirely when no kernel sandboxing
+(`bwrap`/`firejail`) is available on the host:
+
+```bash
+SHADOW_BASH_STRICT=1 .venv/bin/shadow-code
+```
 
 ### Legacy Markdown tools (compatibility only)
 

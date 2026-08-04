@@ -2,8 +2,8 @@
 
 An approval is valid for exactly one execution and only while every fact of
 the action plan (arguments, preview, workspace identity, tool version,
-capability, registry digest) is unchanged. Tokens are never remembered and
-never persisted: a consumed or mismatched token is burned.
+capability, registry digest, execution facts) is unchanged. Tokens are never
+remembered and never persisted: a consumed or mismatched token is burned.
 """
 
 import hashlib
@@ -26,6 +26,7 @@ class ActionPlan(FrozenModel):
     workspace_inode: int
     registry_digest: str
     preview: str
+    execution_facts: str = ""
 
     def digest(self) -> str:
         """SHA-256 hex over the canonical JSON serialization of all fields."""
@@ -43,6 +44,7 @@ def build_action_plan(
     registry_digest: str,
     workspace: WorkspaceIdentity,
     preview: str,
+    execution_facts: str = "",
 ) -> ActionPlan:
     """Build the action plan for a validated call from pure facts."""
     return ActionPlan(
@@ -55,6 +57,7 @@ def build_action_plan(
         workspace_inode=workspace.inode,
         registry_digest=registry_digest,
         preview=preview,
+        execution_facts=execution_facts,
     )
 
 

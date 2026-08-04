@@ -16,6 +16,9 @@ LEGACY_MARKDOWN_TOOLS = _env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS")
 TOOL_OUTPUT_MAX_CHARS = 30_000
 BASH_DEFAULT_TIMEOUT = 120
 BASH_MAX_TIMEOUT = 600
+# Strict mode: deny shell execution entirely when no kernel sandbox
+# (bwrap/firejail) is available, instead of running it unconfined.
+BASH_STRICT = _env_flag("SHADOW_BASH_STRICT")
 MAX_LINES_TO_READ = 2000
 INTERACTIVE_CMDS = {"vim", "vi", "nano", "less", "more", "top", "htop", "man"}
 BLOCKED_PATHS = {

@@ -1,7 +1,9 @@
-"""Typed built-in tool declarations and workspace-contained read handler."""
+"""Typed built-in tool declarations with read and process-execution handlers."""
 
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -18,6 +20,7 @@ from shadow_code.domain.tools import (
     ToolSpec,
 )
 from shadow_code.policy.workspace import WorkspaceGuard
+from shadow_code.process import run_process
 
 from .registry import ToolRegistry
 
@@ -28,9 +31,20 @@ _READ_CHUNK_BYTES = 8192
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceContext:
-    """Execution context carrying the workspace containment guard."""
+    """Execution context carrying the workspace containment guard.
+
+    The process-execution fields default to inert values so read-only
+    callers keep working; the bash handler requires a real workspace root.
+    """
 
     guard: WorkspaceGuard
+    workspace_root: str = ""
+    process_env: Mapping[str, str] = field(default_factory=dict)
+    sandbox_label: str = "unconfined"
+
+    def __post_init__(self) -> None:
+        # Deep-freeze the mapping so the context stays immutable.
+        object.__setattr__(self, "process_env", MappingProxyType(dict(self.process_env)))
 
 
 class CatalogArgs(BaseModel):
@@ -157,12 +171,71 @@ READ_FILE_SPEC = ToolSpec(
     renderer_hint="text",
 )
 
+
+def _bash_handler(call: ToolCall, arguments: BaseModel, context: object) -> ToolResult:
+    if not isinstance(arguments, BashArgs):
+        return ToolResult(
+            call_id=call.call_id,
+            tool_name=call.name,
+            error=ToolError(code="invalid_arguments", message="Expected BashArgs."),
+        )
+    if not isinstance(context, WorkspaceContext) or not context.workspace_root:
+        return ToolResult(
+            call_id=call.call_id,
+            tool_name=call.name,
+            error=ToolError(
+                code="invalid_context",
+                message="Expected WorkspaceContext with a workspace root.",
+            ),
+        )
+
+    timeout = min(arguments.timeout, BASH_MAX_TIMEOUT)
+    try:
+        outcome = run_process(
+            arguments.command,
+            cwd=context.workspace_root,
+            env=context.process_env,
+            timeout_seconds=timeout,
+            max_output_chars=BASH_OUTPUT_LIMIT,
+        )
+    except OSError as error:
+        return ToolResult(
+            call_id=call.call_id,
+            tool_name=call.name,
+            error=ToolError(code="process_error", message=f"{type(error).__name__}: {error}"),
+        )
+
+    parts = [f"$ {arguments.command}"]
+    stdout = _bounded_output(outcome.stdout, BASH_OUTPUT_LIMIT)
+    if outcome.stdout_removed_bytes:
+        stdout += f"\n[...stdout truncated: {outcome.stdout_removed_bytes} bytes removed...]"
+    if stdout:
+        parts.append(stdout)
+    stderr = _bounded_output(outcome.stderr, BASH_OUTPUT_LIMIT)
+    if outcome.stderr_removed_bytes:
+        stderr += f"\n[...stderr truncated: {outcome.stderr_removed_bytes} bytes removed...]"
+    if stderr:
+        parts.append(f"[stderr]\n{stderr}")
+    if outcome.timed_out:
+        parts.append(f"[timed out after {timeout}s; process group terminated]")
+    exit_code = outcome.exit_code if outcome.exit_code is not None else "killed"
+    parts.append(f"exit code: {exit_code}")
+    return ToolResult(
+        call_id=call.call_id,
+        tool_name=call.name,
+        output="\n".join(parts),
+    )
+
+
 BASH_SPEC = ToolSpec(
     name="bash",
     version="1",
-    description="Declare an unconfined shell request; execution is intentionally unavailable.",
+    description=(
+        "Run an UNCONFINED shell command in the workspace after explicit "
+        "one-shot approval; no sandbox is applied."
+    ),
     args_model=BashArgs,
-    handler=None,
+    handler=_bash_handler,
     capability=Capability.PROCESS_EXECUTE,
     risk=RiskLevel.HIGH,
     side_effects=SideEffect.UNKNOWN,
