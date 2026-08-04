@@ -41,6 +41,7 @@ _SLASH_COMMANDS = [
     "/version",
     "/history",
     "/cd",
+    "/prompt",
 ]
 
 # prompt_toolkit style

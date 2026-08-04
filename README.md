@@ -151,6 +151,45 @@ SHADOW_LEGACY_MARKDOWN_TOOLS=1 \
 > uncommitted changes. It bypasses the new native admission and approval path and can invoke
 > file and shell tools. It is a compatibility path, not the production-safe runtime.
 
+### System prompt layers and snapshots
+
+The system prompt is compiled from fixed layers, in this order:
+
+1. **builtin base** — behavioral instructions, owned by the code;
+2. **user overlay** — `~/.config/shadow-code/prompt.md` (optional, appended with a
+   provenance header);
+3. **workspace overlay** — `<workspace>/.shadow-code/prompt.md` (optional);
+4. **generated tool documentation** — always rendered last from the live tool registry.
+
+Layer 4 is never editable: the registry stays the single source of tool truth, and prompt
+text can never grant a capability — policy decisions never read prompt contents.
+
+Every compilation is deterministic (identical inputs produce identical bytes and digest)
+and is stored content-addressed under `~/.local/state/shadow-code/prompts/<digest>/`
+together with its normalized source bytes, so any snapshot reproduces itself exactly
+without consulting current files. Startup and every switch print `prompt snapshot:
+<digest>`; switching prints an audit line `prompt: active <old> -> <new>`. The active
+pointer changes atomically, and only after the target snapshot has been re-verified — any
+failure leaves the previous active untouched.
+
+Overlays are watched per turn: editing one affects only the next turn (recompile, save,
+activate). Use `/prompt` to manage this:
+
+```
+/prompt show                Print the active compiled prompt (first 200 lines)
+/prompt sources             List layers with origin, sha256, and size
+/prompt history             List snapshots (digest, timestamp, layers)
+/prompt diff [digest]       Diff a previous snapshot against the active one
+/prompt validate            Check structure, digests, and tool-doc freshness
+/prompt reload              Force recompile + activate
+/prompt edit                Open the user overlay in $EDITOR, then reload
+/prompt rollback <digest>   Verify + validate a snapshot, then activate it atomically
+```
+
+A rollback is verified against stored bytes and the live registry before activation; if
+anything fails, the active prompt stays unchanged. Rollback pins the snapshot for the
+rest of the session — the next startup recompiles from whatever sources exist then.
+
 ## Features
 
 | Feature | Description |
@@ -177,6 +216,7 @@ SHADOW_LEGACY_MARKDOWN_TOOLS=1 \
 /load [id]     Load session
 /list          List saved sessions
 /skills        List available skills
+/prompt        Inspect, reload, and roll back the system prompt
 /version       Version info
 /exit          Exit
 ```
