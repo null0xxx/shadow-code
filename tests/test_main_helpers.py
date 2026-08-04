@@ -301,7 +301,7 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertIn("policy_denied", bash_message["content"])
             self.assertIn("bash disabled: strict mode", stdout.getvalue())
 
-    def test_mutation_strict_denies_write_file_but_allows_read_file(self):
+    def test_mutation_strict_exports_write_file_patch_but_allows_read_file(self):
         import importlib
         import tempfile
 
@@ -314,7 +314,7 @@ class TestNativeToolAdmission(unittest.TestCase):
             {
                 "call_id": "call-1",
                 "name": "write_file",
-                "arguments": {"file_path": "new.txt", "content": "denied\n"},
+                "arguments": {"file_path": "new.txt", "content": "exported\n"},
             },
         ]
 
@@ -335,6 +335,7 @@ class TestNativeToolAdmission(unittest.TestCase):
             client.chat_stream.side_effect = chat_stream
             conversation = Conversation()
 
+            # Inputs: user message, approval answer for the patch export, exit.
             with (
                 patch.object(main_module, "_RICH", False),
                 patch.object(main_module, "_HAS_REPL", False),
@@ -350,7 +351,7 @@ class TestNativeToolAdmission(unittest.TestCase):
                 patch.object(main_module, "_register_optional_tools"),
                 patch.object(main_module.tool_reg, "register"),
                 patch.object(main_module.signal, "signal"),
-                patch("builtins.input", side_effect=["run both", "/exit"]),
+                patch("builtins.input", side_effect=["run both", "y", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
                 main_module.main()
@@ -360,9 +361,21 @@ class TestNativeToolAdmission(unittest.TestCase):
             read_message = next(m for m in tool_messages if m["name"] == "read_file")
             write_message = next(m for m in tool_messages if m["name"] == "write_file")
             self.assertIn("strict content", read_message["content"])
-            self.assertIn("policy_denied", write_message["content"])
-            self.assertIn("file mutations disabled", stdout.getvalue())
+            # The approved change is exported as a patch, never executed.
+            self.assertIn("status: exported", write_message["content"])
+            self.assertNotIn("status: executed", write_message["content"])
+            self.assertIn("file mutations run in strict mode", stdout.getvalue())
+            self.assertIn("mutation: write new.txt [strict: patch export]", stdout.getvalue())
             self.assertFalse(os.path.exists(os.path.join(workspace, "new.txt")))
+            exports_dir = os.path.join(workspace, ".shadow-code-exports")
+            exports = os.listdir(exports_dir)
+            self.assertEqual(len(exports), 1)
+            self.assertTrue(exports[0].endswith("-write-new.txt.patch"))
+            with open(os.path.join(exports_dir, exports[0]), encoding="utf-8") as handle:
+                patch_text = handle.read()
+            self.assertIn("--- /dev/null", patch_text)
+            self.assertIn("+++ b/new.txt", patch_text)
+            self.assertIn("+exported", patch_text)
 
     def test_approved_write_file_call_lands_on_disk_through_main(self):
         import importlib
@@ -672,6 +685,7 @@ class TestMutationAdmission(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].success)
         self.assertEqual(written, "exact bytes\n")
+        self.assertIn("status: executed", results[0].output)
         self.assertIn("before: missing", results[0].output)
         self.assertIn("after:  device=", results[0].output)
         self.assertIn("sha256=", results[0].output)
@@ -779,6 +793,57 @@ class TestMutationAdmission(unittest.TestCase):
         approval.assert_not_called()
         self.assertEqual(results[0].error.code, "ambiguous_match")
         self.assertEqual(untouched, "foo foo\n")
+
+    def test_approved_write_in_export_mode_exports_patch_only(self):
+        import os
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+        from shadow_code.tools.catalog import WorkspaceContext
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        export_context = WorkspaceContext(
+            guard=guard, workspace_root=workspace.name, mutation_mode="export"
+        )
+        calls = [
+            {
+                "call_id": "w5",
+                "name": "write_file",
+                "arguments": {"file_path": "out.txt", "content": "patch me\n"},
+            }
+        ]
+        plans = []
+
+        def approve(plan):
+            plans.append(plan)
+            return True
+
+        with (
+            workspace,
+            guard,
+            patch("shadow_code.main._request_approval", side_effect=approve),
+        ):
+            results = _admit_native_calls(
+                calls, registry, engine, export_context, ApprovalAuthority()
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+            self.assertIn("status: exported", results[0].output)
+            self.assertNotIn("status: executed", results[0].output)
+            self.assertIn("patch: .shadow-code-exports/", results[0].output)
+            self.assertIn("NOT modified", results[0].output)
+            # The approval preview announces a patch export, not an apply.
+            self.assertIn("mutation: write out.txt [strict: patch export]", plans[0].preview)
+            # The workspace target was never created.
+            self.assertFalse(os.path.exists(os.path.join(workspace.name, "out.txt")))
+            exports_dir = os.path.join(workspace.name, ".shadow-code-exports")
+            exports = os.listdir(exports_dir)
+            self.assertEqual(len(exports), 1)
+            with open(os.path.join(exports_dir, exports[0]), encoding="utf-8") as handle:
+                patch_text = handle.read()
+            self.assertIn("+++ b/out.txt", patch_text)
+            self.assertIn("+patch me", patch_text)
 
     def test_ungranted_write_capability_is_a_typed_policy_denial(self):
         import tempfile
