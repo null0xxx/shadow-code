@@ -64,15 +64,19 @@ responses. The current default runtime supports:
 - slash commands such as `/help`, `/save`, `/load`, and `/compact`;
 - optional Rich and prompt-toolkit terminal presentation.
 
-### Native tool limitation
+### Native tool execution and approval
 
-Native coding-agent tool calls are recognized but **not executed**. Shadow Code reports
-`native_tools_unavailable` and stops that tool turn. This fail-closed behavior is intentional:
-the PolicyEngine exists, but production admission, approval, and executor wiring is not yet
-complete.
+Read-only native tool calls (`read_file`) execute through the admission pipeline: registry
+validation, then policy, then a contained executor. Calls with side effects or unknown
+effects (`bash`) require an interactive one-shot approval: Shadow Code shows the exact
+action plan (tool, version, capability, arguments, workspace, digest) and executes only
+after an explicit `y`. The approval token is bound to the action-plan digest, authorizes
+exactly one execution, and is burned by any mismatch — changed arguments, workspace, tool
+version, or registry reject it. Denial or cancellation is final and the call is not
+retried.
 
-Therefore, the current safe/default build must not be described as a fully operational coding
-agent: it cannot yet safely read, edit, or execute project files through native tool calls.
+`bash` has no executable handler yet: an approved bash call is admitted and consumes its
+token, then reports `handler_unavailable`. Process execution arrives in a later unit.
 
 ### Legacy Markdown tools (compatibility only)
 
@@ -185,7 +189,7 @@ shadow-code/
 ## How It Works
 
 1. **System prompt** tells the LLM about coding practices and the currently enabled protocols
-2. **Native tool calling** currently fails closed until admission and approval wiring is complete
+2. **Native tool calling** runs read-only tools through policy; side-effecting calls need a one-shot digest-bound approval
 3. **Legacy tool calling** uses ` ```tool_call ` Markdown only when explicitly enabled
 4. **Context management** follows Claude Code's pattern: clear old results at 55%, LLM summarization at 65%, emergency truncate at 85%
 5. **KV cache** optimization: system prompt is 100% static for Ollama cache hits

@@ -227,15 +227,17 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertEqual(tool_messages[0]["name"], "read_file")
             self.assertIn("admitted content", tool_messages[0]["content"])
 
-            # Every streamed turn advertises exactly the read-only schema.
+            # Every streamed turn advertises the registry schemas (sorted by name).
             self.assertEqual(len(payloads), 2)
             for tools in payloads:
                 self.assertIsNotNone(tools)
-                self.assertEqual([t["function"]["name"] for t in tools], ["read_file"])
+                names = [t["function"]["name"] for t in tools]
+                self.assertEqual(names, ["bash", "read_file"])
 
             # System prompt uses the native section plus generated tool docs.
             self.assertNotIn("No executable tool protocol is active", prompts[0])
             self.assertIn("## read_file", prompts[0])
+            self.assertIn("## bash", prompts[0])
             self.assertNotIn("native_tools_unavailable", stdout.getvalue())
 
 
@@ -245,6 +247,7 @@ class TestAdmitNativeCalls(unittest.TestCase):
     def test_bash_unknown_and_malformed_calls_never_execute(self):
         import tempfile
 
+        from shadow_code.domain.approval import ApprovalAuthority
         from shadow_code.domain.tools import Capability
         from shadow_code.main import _admit_native_calls
         from shadow_code.policy.workspace import WorkspaceGuard
@@ -263,7 +266,9 @@ class TestAdmitNativeCalls(unittest.TestCase):
 
             registry = ToolRegistry((READ_FILE_SPEC,))
             engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
-            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+            results = _admit_native_calls(
+                calls, registry, engine, WorkspaceContext(guard), ApprovalAuthority()
+            )
 
         self.assertEqual(len(results), 4)
         self.assertEqual(
@@ -273,31 +278,67 @@ class TestAdmitNativeCalls(unittest.TestCase):
         for result in results:
             self.assertFalse(result.success)
 
-    def test_side_effecting_calls_fail_closed_without_approval_authority(self):
+    def _bash_admission(self):
         import tempfile
 
         from shadow_code.domain.policy import PolicyFacts
         from shadow_code.domain.tools import Capability
-        from shadow_code.main import _admit_native_calls
         from shadow_code.policy.engine import PolicyEngine
         from shadow_code.policy.workspace import WorkspaceGuard
         from shadow_code.tools.catalog import BASH_SPEC, READ_FILE_SPEC, WorkspaceContext
         from shadow_code.tools.registry import ToolRegistry
 
-        with tempfile.TemporaryDirectory() as workspace, WorkspaceGuard(workspace) as guard:
-            registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
-            capabilities = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
-            engine = PolicyEngine(PolicyFacts(capabilities, guard.identity))
-            calls = [{"call_id": "b1", "name": "bash", "arguments": {"command": "id"}}]
-            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+        workspace = tempfile.TemporaryDirectory()
+        guard = WorkspaceGuard(workspace.name)
+        registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
+        capabilities = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
+        engine = PolicyEngine(PolicyFacts(capabilities, guard.identity))
+        calls = [{"call_id": "b1", "name": "bash", "arguments": {"command": "id"}}]
+        return workspace, guard, calls, registry, engine, WorkspaceContext(guard)
+
+    def test_approved_side_effecting_call_reaches_executor_without_handler(self):
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, calls, registry, engine, context = self._bash_admission()
+        with workspace, guard, patch("builtins.input", return_value="y"):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        # Approved: the one-shot token is consumed by the executor; bash has
+        # no handler yet, so the typed handler_unavailable result is returned.
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "handler_unavailable")
+
+    def test_denied_side_effecting_call_is_final_and_not_retried(self):
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, calls, registry, engine, context = self._bash_admission()
+        with workspace, guard, patch("builtins.input", return_value="n") as prompt:
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
 
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
-        self.assertEqual(results[0].error.code, "approval_unavailable")
+        self.assertEqual(results[0].error.code, "approval_denied")
+        prompt.assert_called_once()
+
+    def test_cancelled_side_effecting_call_is_a_typed_denial(self):
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, calls, registry, engine, context = self._bash_admission()
+        with workspace, guard, patch("builtins.input", side_effect=EOFError):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "approval_denied")
 
     def test_ungranted_capability_is_a_typed_policy_denial(self):
         import tempfile
 
+        from shadow_code.domain.approval import ApprovalAuthority
         from shadow_code.domain.policy import PolicyFacts
         from shadow_code.domain.tools import Capability
         from shadow_code.main import _admit_native_calls
@@ -310,7 +351,9 @@ class TestAdmitNativeCalls(unittest.TestCase):
             registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
             engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
             calls = [{"call_id": "b2", "name": "bash", "arguments": {"command": "id"}}]
-            results = _admit_native_calls(calls, registry, engine, WorkspaceContext(guard))
+            results = _admit_native_calls(
+                calls, registry, engine, WorkspaceContext(guard), ApprovalAuthority()
+            )
 
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)

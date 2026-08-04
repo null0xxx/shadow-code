@@ -28,6 +28,12 @@ from .config import (
 )
 from .conversation import Conversation
 from .display import TAG_START, StreamDisplay
+from .domain.approval import (
+    ActionPlan,
+    ApprovalAuthority,
+    build_action_plan,
+    render_action_preview,
+)
 from .domain.policy import PolicyDisposition, PolicyFacts, WorkspaceAccessError
 from .domain.tools import Capability, ToolError, ToolResult
 from .executor import execute_validated_call
@@ -39,7 +45,7 @@ from .prompt import render_system_prompt, render_tool_documentation
 from .safety import check_destructive
 from .skills import get_skill, list_skills
 from .tool_context import ToolContext
-from .tools.catalog import READ_FILE_SPEC, WorkspaceContext
+from .tools.catalog import BASH_SPEC, READ_FILE_SPEC, WorkspaceContext
 from .tools.registry import ToolRegistry
 
 # Optional imports -- graceful fallback
@@ -90,17 +96,40 @@ def _legacy_markdown_protocol_error(
     )
 
 
+def _request_approval(plan: ActionPlan) -> bool:
+    """Render the action plan and ask for a one-shot interactive approval.
+
+    Fail-closed: only an explicit "y" approves; empty input, EOF, interrupt,
+    or anything else denies. (The TUI approval control is a later unit.)
+    """
+    print("Action requires approval:")
+    print(f"  tool:       {plan.tool_name} v{plan.tool_version}")
+    print(f"  capability: {plan.capability}")
+    print(f"  arguments:  {plan.canonical_arguments_json}")
+    print(f"  workspace:  device={plan.workspace_device} inode={plan.workspace_inode}")
+    print(f"  plan:       sha256:{plan.digest()[:16]}...")
+    print(f"  preview:    {plan.preview}")
+    try:
+        answer = input("Approve this exact action? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer == "y"
+
+
 def _admit_native_calls(
     native_calls: list[dict],
     registry: ToolRegistry,
     policy_engine: PolicyEngine,
     execution_context: WorkspaceContext,
+    approval_authority: ApprovalAuthority,
 ) -> list[ToolResult]:
     """Run collected native calls through validate -> policy -> execute.
 
-    Fail-closed at every step: invalid envelopes, unregistered tools, policy
-    denials, and approval-required calls all produce typed error results and
-    never reach a handler.
+    Fail-closed at every step: invalid envelopes, unregistered tools, and
+    policy denials produce typed error results and never reach a handler.
+    Approval-required calls ask interactively for a one-shot, digest-bound
+    token; denial or cancellation is final and the call is not retried.
     """
     results = []
     for raw_call in native_calls:
@@ -132,14 +161,34 @@ def _admit_native_calls(
                 )
             )
         else:
+            plan = build_action_plan(
+                validated,
+                registry_digest=registry.digest,
+                workspace=execution_context.guard.identity,
+                preview=render_action_preview(validated),
+            )
+            if not _request_approval(plan):
+                results.append(
+                    ToolResult(
+                        call_id=validated.call.call_id,
+                        tool_name=validated.call.name,
+                        error=ToolError(
+                            code="approval_denied",
+                            message=(
+                                "User denied or cancelled the approval; the call was not executed."
+                            ),
+                        ),
+                    )
+                )
+                continue
+            token = approval_authority.issue(plan)
             results.append(
-                ToolResult(
-                    call_id=validated.call.call_id,
-                    tool_name=validated.call.name,
-                    error=ToolError(
-                        code="approval_unavailable",
-                        message=("Approval authority is not wired yet; the call was not executed."),
-                    ),
+                execute_validated_call(
+                    validated,
+                    execution_context,
+                    approval=token,
+                    authority=approval_authority,
+                    plan=plan,
                 )
             )
     return results
@@ -149,18 +198,23 @@ def main():
     cwd = os.getcwd()
     ctx = ToolContext(cwd)
 
-    # Read-only admission: containment guard, policy facts, runtime registry.
-    # Only read_file is advertised; bash remains declaration-only.
+    # Admission: containment guard, policy facts, runtime registry.
+    # bash is advertised but declaration-only: policy requires approval and
+    # the executor reports handler_unavailable until WU-03 lands.
     try:
         workspace_guard = WorkspaceGuard(cwd)
     except WorkspaceAccessError as e:
         print(f"Error: cannot establish workspace containment: {e}", file=sys.stderr)
         sys.exit(1)
-    runtime_registry = ToolRegistry((READ_FILE_SPEC,))
+    runtime_registry = ToolRegistry((READ_FILE_SPEC, BASH_SPEC))
     policy_engine = PolicyEngine(
-        PolicyFacts({Capability.FILESYSTEM_READ}, workspace_guard.identity)
+        PolicyFacts(
+            {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE},
+            workspace_guard.identity,
+        )
     )
     execution_context = WorkspaceContext(guard=workspace_guard)
+    approval_authority = ApprovalAuthority()
     tool_schemas = render_ollama_tool_schemas(runtime_registry)
     system_prompt = render_system_prompt(
         native_tools=True,
@@ -532,7 +586,11 @@ def main():
             if native_calls:
                 conv.add_assistant_tool_call(native_calls)
                 results = _admit_native_calls(
-                    native_calls, runtime_registry, policy_engine, execution_context
+                    native_calls,
+                    runtime_registry,
+                    policy_engine,
+                    execution_context,
+                    approval_authority,
                 )
                 for result in results:
                     if result.success:
