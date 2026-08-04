@@ -11,10 +11,13 @@
 #
 # Falls back to plain-text mode if rich/prompt_toolkit not installed.
 
+import difflib
 import json
 import os
 import platform
+import shlex
 import signal
+import subprocess
 import sys
 from datetime import datetime
 
@@ -48,7 +51,15 @@ from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
 from .policy.engine import PolicyEngine
 from .policy.workspace import WorkspaceGuard
 from .process import build_process_env, classify_command, detect_sandbox, execution_facts
-from .prompt import render_system_prompt, render_tool_documentation
+from .prompt_compiler import (
+    CompiledPrompt,
+    PromptCompileError,
+    PromptManager,
+    default_user_overlay_path,
+    default_workspace_overlay_path,
+    validate_prompt,
+)
+from .prompt_store import PromptStore, PromptStoreError, default_store_dir
 from .safety import check_destructive
 from .skills import get_skill, list_skills
 from .tool_context import ToolContext
@@ -301,6 +312,123 @@ def _admit_native_calls(
     return results
 
 
+def _report_prompt_switch(compiled: CompiledPrompt, previous: str | None) -> None:
+    """Print the snapshot attribution line and, on a switch, the audit line.
+
+    WU-04: the audit trail is this printed line plus the snapshot history;
+    the durable event store arrives with WU-06.
+    """
+    print(f"prompt snapshot: {compiled.digest[:12]}")
+    if previous:
+        print(f"prompt: active {previous[:12]} -> {compiled.digest[:12]}")
+
+
+def _prompt_show(manager: PromptManager) -> None:
+    lines = manager.active.compiled_text.splitlines()
+    for line in lines[:200]:
+        print(line)
+    if len(lines) > 200:
+        print(f"... [{len(lines) - 200} more lines truncated]")
+
+
+def _prompt_diff(manager: PromptManager, prefix: str) -> None:
+    active = manager.active
+    if prefix:
+        base = manager.store.load(prefix)
+    else:
+        snapshots = [s for s in manager.store.history() if s.digest != active.digest]
+        if not snapshots:
+            print("  No previous snapshot to diff against")
+            return
+        base = snapshots[0]
+    diff = list(
+        difflib.unified_diff(
+            base.compiled_text.splitlines(),
+            active.compiled_text.splitlines(),
+            fromfile=f"snapshot {base.digest[:12]}",
+            tofile=f"active {active.digest[:12]}",
+            lineterm="",
+        )
+    )
+    if not diff:
+        print("  No differences")
+        return
+    for line in diff[:400]:
+        print(line)
+    if len(diff) > 400:
+        print(f"... [{len(diff) - 400} more diff lines truncated]")
+
+
+def _prompt_edit(manager: PromptManager) -> None:
+    """Open the user overlay in $EDITOR, then recompile + activate."""
+    editor = os.environ.get("EDITOR", "vi")
+    path = manager.user_path
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# shadow-code user prompt overlay\n", encoding="utf-8")
+    argv = [*shlex.split(editor), str(path)]
+    try:
+        # User-chosen $EDITOR launched interactively on explicit request.
+        subprocess.run(argv, check=False)  # nosec B603 B607
+    except OSError as exc:
+        print(f"  Cannot launch editor {editor!r}: {exc}")
+        return
+    compiled, previous = manager.reload()
+    _report_prompt_switch(compiled, previous)
+
+
+def _handle_prompt_command(user_input: str, manager: PromptManager) -> None:
+    """Dispatch /prompt subcommands: inspect, validate, reload, roll back."""
+    args = user_input[len("/prompt") :].strip().split()
+    sub = args[0] if args else ""
+    try:
+        if sub == "show":
+            _prompt_show(manager)
+        elif sub == "sources":
+            print(f"  active: {manager.active.digest[:12]} ({manager.active.created_utc})")
+            for source in manager.active.sources:
+                print(
+                    f"  {source.layer:10} {source.origin}  "
+                    f"sha256:{source.sha256[:12]}  {source.size} bytes"
+                )
+        elif sub == "history":
+            snapshots = manager.store.history()
+            if not snapshots:
+                print("  No prompt snapshots")
+            for snapshot in snapshots:
+                marker = "*" if snapshot.digest == manager.active.digest else " "
+                layers = ",".join(source.layer for source in snapshot.sources)
+                print(f" {marker} {snapshot.digest[:12]}  {snapshot.created_utc}  {layers}")
+        elif sub == "diff":
+            _prompt_diff(manager, args[1] if len(args) > 1 else "")
+        elif sub == "validate":
+            issues = validate_prompt(manager.active, manager.registry)
+            if issues:
+                for issue in issues:
+                    print(f"  issue: {issue}")
+            else:
+                print("  prompt OK: structure, digests, and tool docs verified")
+        elif sub == "reload":
+            compiled, previous = manager.reload()
+            _report_prompt_switch(compiled, previous)
+        elif sub == "edit":
+            _prompt_edit(manager)
+        elif sub == "rollback":
+            if len(args) < 2:
+                print("  Usage: /prompt rollback <digest-prefix>")
+                return
+            target, previous = manager.rollback(args[1])
+            _report_prompt_switch(target, previous)
+        else:
+            print(
+                "  Usage: /prompt show|sources|history|diff [digest]|validate|"
+                "reload|edit|rollback <digest-prefix>"
+            )
+    except (PromptCompileError, PromptStoreError) as exc:
+        # Fail visibly; the active snapshot stays untouched on any error.
+        print(f"  prompt {sub or '?'} failed [{exc.code}]: {exc.message}")
+
+
 def main():
     cwd = os.getcwd()
     ctx = ToolContext(cwd)
@@ -341,11 +469,23 @@ def main():
         )
     approval_authority = ApprovalAuthority()
     tool_schemas = render_ollama_tool_schemas(runtime_registry)
-    system_prompt = render_system_prompt(
-        native_tools=True,
-        legacy_markdown_tools=LEGACY_MARKDOWN_TOOLS,
-    )
-    system_prompt += "\n\n" + render_tool_documentation(runtime_registry)
+
+    # Layered prompt: compiled from builtin base + optional user/workspace
+    # overlays + generated tool docs (registry is the only tool truth).
+    # Prompt contents never touch PolicyFacts -- text cannot grant capabilities.
+    try:
+        prompt_manager, previous_prompt = PromptManager.bootstrap(
+            registry=runtime_registry,
+            store=PromptStore(default_store_dir()),
+            user_path=default_user_overlay_path(),
+            workspace_path=default_workspace_overlay_path(cwd),
+            legacy_markdown_tools=LEGACY_MARKDOWN_TOOLS,
+        )
+    except (PromptCompileError, PromptStoreError) as e:
+        print(f"Error: cannot compile system prompt [{e.code}]: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    system_prompt = prompt_manager.active.compiled_text
+    _report_prompt_switch(prompt_manager.active, previous_prompt)
 
     # Register all tools
     from .tools.bash import BashTool
@@ -398,7 +538,7 @@ def main():
             print(f"[DB warning: {e}]")
             db = None
 
-    print("Commands: /help /clear /exit /tokens /save /load /list /info\n")
+    print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt\n")
 
     conv = Conversation()
     interrupted = False
@@ -523,6 +663,7 @@ def main():
                 ("/load [id]", "Load session"),
                 ("/list", "List saved sessions"),
                 ("/skills", "List available skills"),
+                ("/prompt <sub>", "Inspect/reload/rollback the system prompt"),
             ]
             # Add skills
             for skill_name, skill_desc in list_skills():
@@ -604,6 +745,10 @@ def main():
                 print("  [DB not available]")
             continue
 
+        if user_input.startswith("/prompt"):
+            _handle_prompt_command(user_input, prompt_manager)
+            continue
+
         # Check if it's a skill command (e.g., /commit, /simplify, /review file.py)
         if user_input.startswith("/"):
             parts = user_input[1:].split(None, 1)
@@ -620,6 +765,19 @@ def main():
             else:
                 print(f"  Unknown command: /{skill_name}. Type /help")
                 continue
+
+        # === Per-turn prompt source watch ===
+        # An overlay edit affects only the next turn; on any failure the
+        # previous active snapshot stays in place and a warning is printed.
+        try:
+            watched = prompt_manager.watch()
+        except (PromptCompileError, PromptStoreError) as e:
+            print(f"[prompt warning: keeping {prompt_manager.active.digest[:12]}: {e.message}]")
+        else:
+            if watched is not None:
+                compiled, previous = watched
+                system_prompt = compiled.compiled_text
+                _report_prompt_switch(compiled, previous)
 
         # === Inject environment on first message ===
         if first_message:

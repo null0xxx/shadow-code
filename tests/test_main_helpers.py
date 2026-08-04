@@ -164,7 +164,11 @@ class TestNativeToolAdmission(unittest.TestCase):
             "arguments": {"file_path": "hello.txt"},
         }
 
-        with tempfile.TemporaryDirectory() as workspace:
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as state_home,
+            tempfile.TemporaryDirectory() as config_home,
+        ):
             with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
                 handle.write("admitted content\n")
 
@@ -204,6 +208,10 @@ class TestNativeToolAdmission(unittest.TestCase):
                     return_value=main_module.tool_reg.ToolResult(True, "unexpected"),
                 ) as dispatch,
                 patch.object(main_module.signal, "signal"),
+                patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": config_home},
+                ),
                 patch("builtins.input", side_effect=["read hello", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 patch.object(
@@ -255,7 +263,11 @@ class TestNativeToolAdmission(unittest.TestCase):
             {"call_id": "call-1", "name": "bash", "arguments": {"command": "echo ok"}},
         ]
 
-        with tempfile.TemporaryDirectory() as workspace:
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as state_home,
+            tempfile.TemporaryDirectory() as config_home,
+        ):
             with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
                 handle.write("strict content\n")
 
@@ -288,6 +300,10 @@ class TestNativeToolAdmission(unittest.TestCase):
                 patch.object(main_module, "_register_optional_tools"),
                 patch.object(main_module.tool_reg, "register"),
                 patch.object(main_module.signal, "signal"),
+                patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": config_home},
+                ),
                 patch("builtins.input", side_effect=["run both", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
@@ -318,7 +334,11 @@ class TestNativeToolAdmission(unittest.TestCase):
             },
         ]
 
-        with tempfile.TemporaryDirectory() as workspace:
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as state_home,
+            tempfile.TemporaryDirectory() as config_home,
+        ):
             with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
                 handle.write("strict content\n")
 
@@ -351,6 +371,10 @@ class TestNativeToolAdmission(unittest.TestCase):
                 patch.object(main_module, "_register_optional_tools"),
                 patch.object(main_module.tool_reg, "register"),
                 patch.object(main_module.signal, "signal"),
+                patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": config_home},
+                ),
                 patch("builtins.input", side_effect=["run both", "y", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
@@ -391,7 +415,11 @@ class TestNativeToolAdmission(unittest.TestCase):
             "arguments": {"file_path": "created.txt", "content": "approved content\n"},
         }
 
-        with tempfile.TemporaryDirectory() as workspace:
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as state_home,
+            tempfile.TemporaryDirectory() as config_home,
+        ):
             client = MagicMock()
             client.health_check.return_value = (True, "OK")
             client.last_prompt_tokens = 0
@@ -420,6 +448,10 @@ class TestNativeToolAdmission(unittest.TestCase):
                 patch.object(main_module, "_register_optional_tools"),
                 patch.object(main_module.tool_reg, "register"),
                 patch.object(main_module.signal, "signal"),
+                patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": config_home},
+                ),
                 patch("builtins.input", side_effect=["create it", "y", "/exit"]),
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
