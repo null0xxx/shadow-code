@@ -2,6 +2,7 @@
 
 import ctypes
 import errno
+import fcntl
 import os
 import platform
 import stat
@@ -31,6 +32,8 @@ _OS_FLAGS = ("O_PATH", "O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK")
 _FLAGS_OK = all(hasattr(os, name) for name in _OS_FLAGS)
 _ROOT_FLAGS = sum(getattr(os, name, 0) for name in _OS_FLAGS[:3])
 _READ_FLAGS = os.O_RDONLY | sum(getattr(os, name, 0) for name in _OS_FLAGS[2:])
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+_MUTATION_LOCK_NAME = ".shadow-code.lock"
 
 
 class _StatLike(Protocol):
@@ -87,6 +90,13 @@ def _normalized_relative_path(path: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise WorkspaceAccessError(WorkspaceFailure.INVALID_PATH, "path must be normalized")
     return "/".join(parts)
+
+
+def _normalized_relative_dir(path: str) -> str:
+    """Normalize a relative directory path; "" and "." denote the root."""
+    if path in {"", "."}:
+        return "."
+    return _normalized_relative_path(path)
 
 
 def _normalize_open_error(error: OSError) -> WorkspaceAccessError:
@@ -176,6 +186,80 @@ class WorkspaceGuard:
             except OSError as error:
                 if primary is None:
                     raise WorkspaceAccessError(WorkspaceFailure.IO_ERROR, "close failed") from error
+
+    @contextmanager
+    def open_dir(self, path: str) -> Iterator[int]:
+        """Resolve a normalized relative directory beneath the pinned root.
+
+        "" or "." selects the workspace root itself. The yielded descriptor
+        is a real directory fd suitable for ``dir_fd=`` syscalls; it is
+        resolved with the same no-symlink, beneath-root discipline as
+        :meth:`open_read` and fails closed on non-directories or
+        containment violations.
+        """
+        relative_dir = _normalized_relative_dir(path)
+        root_fd = self._verified_root_fd()
+        try:
+            descriptor = self._openat2(root_fd, relative_dir, _DIR_FLAGS)
+        except OSError as error:
+            raise _normalize_open_error(error) from error
+        primary: BaseException | None = None
+        try:
+            try:
+                mode = os.fstat(descriptor).st_mode
+            except OSError as error:
+                raise WorkspaceAccessError(WorkspaceFailure.IO_ERROR, "fstat failed") from error
+            if not stat.S_ISDIR(mode):
+                raise WorkspaceAccessError(WorkspaceFailure.IO_ERROR, "path is not a directory")
+            yield descriptor
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                self._close(descriptor)
+            except OSError as error:
+                if primary is None:
+                    raise WorkspaceAccessError(WorkspaceFailure.IO_ERROR, "close failed") from error
+
+    @contextmanager
+    def mutation_lock(self) -> Iterator[None]:
+        """Hold the cooperative per-workspace mutation lock.
+
+        COOPERATIVE ONLY: this advisory flock is honored solely by Shadow
+        Code writers that voluntarily take it, serializing their mutation
+        commits. It is NOT a security boundary and offers no protection
+        against uncooperative or hostile processes.
+
+        The lock file is opened descriptor-relative to the pinned root with
+        O_NOFOLLOW; the flock is released and descriptors closed on exit.
+        """
+        with self.open_dir(".") as dir_fd:
+            try:
+                lock_fd = os.open(
+                    _MUTATION_LOCK_NAME,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+            except OSError as error:
+                raise WorkspaceAccessError(
+                    WorkspaceFailure.IO_ERROR,
+                    f"cannot open mutation lock: {error.strerror}",
+                ) from error
+            try:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                except OSError as error:
+                    raise WorkspaceAccessError(
+                        WorkspaceFailure.IO_ERROR,
+                        f"cannot take mutation lock: {error.strerror}",
+                    ) from error
+                yield
+            finally:
+                with suppress(OSError):
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                self._close(lock_fd)
 
     def close(self) -> None:
         root_fd = self._root_fd

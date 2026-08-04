@@ -16,19 +16,25 @@ from shadow_code.tools.catalog import (
     BASH_OUTPUT_LIMIT,
     BASH_SPEC,
     DEFAULT_TOOL_REGISTRY,
+    EDIT_FILE_SPEC,
     READ_FILE_OUTPUT_LIMIT,
     READ_FILE_SPEC,
+    WRITE_FILE_SPEC,
     BashArgs,
+    EditFileArgs,
     ReadFileArgs,
     WorkspaceContext,
+    WriteFileArgs,
     _bash_handler,
     _bounded_output,
+    _edit_file_handler,
     _read_file_handler,
+    _write_file_handler,
 )
 
 
 def test_default_catalog_has_exact_order_and_truthful_metadata() -> None:
-    assert DEFAULT_TOOL_REGISTRY.names == ("bash", "read_file")
+    assert DEFAULT_TOOL_REGISTRY.names == ("bash", "edit_file", "read_file", "write_file")
     assert BASH_SPEC.handler is _bash_handler
     assert "UNCONFINED" in BASH_SPEC.description
     assert "no sandbox" in BASH_SPEC.description
@@ -39,6 +45,18 @@ def test_default_catalog_has_exact_order_and_truthful_metadata() -> None:
     assert READ_FILE_SPEC.risk is RiskLevel.LOW
     assert READ_FILE_SPEC.side_effects is SideEffect.NONE
     assert READ_FILE_SPEC.max_output_chars == 30_000
+    mutation_specs = (
+        (WRITE_FILE_SPEC, _write_file_handler),
+        (EDIT_FILE_SPEC, _edit_file_handler),
+    )
+    for spec, handler in mutation_specs:
+        assert spec.handler is handler
+        assert spec.capability is Capability.FILESYSTEM_WRITE
+        assert spec.risk is RiskLevel.HIGH
+        assert spec.side_effects is SideEffect.MUTATING
+        assert spec.renderer_hint == "diff"
+        assert spec.idempotency is False
+        assert spec.parallel_safety is False
 
 
 @pytest.mark.parametrize(
@@ -308,3 +326,136 @@ def test_read_file_handler_rejects_wrong_arguments_and_context(tmp_path: Path) -
     assert wrong_arguments.error.code == "invalid_arguments"
     assert wrong_context.error is not None
     assert wrong_context.error.code == "invalid_context"
+
+
+def test_write_file_args_are_strict() -> None:
+    for arguments in (
+        {},
+        {"file_path": "/abs.txt", "content": "x"},
+        {"file_path": "a.txt"},
+        {"file_path": "a.txt", "content": 1},
+        {"file_path": "a.txt", "content": "x" * 200_001},
+        {"file_path": "a/../b.txt", "content": "x"},
+        {"file_path": "a.txt", "content": "x", "extra": 1},
+    ):
+        result = DEFAULT_TOOL_REGISTRY.validate_call(
+            {"call_id": "w-invalid", "name": "write_file", "arguments": arguments}
+        )
+        assert isinstance(result, ToolError)
+
+    for arguments in (
+        {"file_path": "a.txt", "old_text": "", "new_text": "b"},
+        {"file_path": "a.txt", "old_text": "a"},
+    ):
+        result = DEFAULT_TOOL_REGISTRY.validate_call(
+            {"call_id": "e-invalid", "name": "edit_file", "arguments": arguments}
+        )
+        assert isinstance(result, ToolError)
+
+
+def test_write_file_handler_writes_through_guard(tmp_path: Path) -> None:
+    call = ToolCall(
+        call_id="write-1",
+        name="write_file",
+        arguments={"file_path": "out.txt", "content": "written\n"},
+    )
+    with WorkspaceGuard(tmp_path) as guard:
+        result = _write_file_handler(
+            call,
+            WriteFileArgs(file_path="out.txt", content="written\n"),
+            WorkspaceContext(guard),
+        )
+
+    assert result.success is True
+    assert result.call_id == "write-1"
+    assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "written\n"
+    assert result.output is not None
+    assert "mutation: write out.txt" in result.output
+    assert "before: missing" in result.output
+    assert "sha256=" in result.output
+    assert "bytes written: 8" in result.output
+    assert "not a security boundary" in result.output
+
+
+def test_edit_file_handler_replaces_exact_text(tmp_path: Path) -> None:
+    (tmp_path / "code.py").write_text("value = 1\n", encoding="utf-8")
+    call = ToolCall(
+        call_id="edit-1",
+        name="edit_file",
+        arguments={"file_path": "code.py", "old_text": "1", "new_text": "2"},
+    )
+    with WorkspaceGuard(tmp_path) as guard:
+        result = _edit_file_handler(
+            call,
+            EditFileArgs(file_path="code.py", old_text="1", new_text="2"),
+            WorkspaceContext(guard),
+        )
+
+    assert result.success is True
+    assert (tmp_path / "code.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert result.output is not None
+    assert "mutation: edit code.py" in result.output
+    assert "before: device=" in result.output
+
+
+def test_edit_file_handler_surfaces_typed_plan_errors(tmp_path: Path) -> None:
+    (tmp_path / "dup.txt").write_text("foo foo\n", encoding="utf-8")
+    ambiguous_call = ToolCall(
+        call_id="edit-amb",
+        name="edit_file",
+        arguments={"file_path": "dup.txt", "old_text": "foo", "new_text": "bar"},
+    )
+    no_match_call = ToolCall(
+        call_id="edit-none",
+        name="edit_file",
+        arguments={"file_path": "missing.txt", "old_text": "x", "new_text": "y"},
+    )
+    with WorkspaceGuard(tmp_path) as guard:
+        ambiguous = _edit_file_handler(
+            ambiguous_call,
+            EditFileArgs(file_path="dup.txt", old_text="foo", new_text="bar"),
+            WorkspaceContext(guard),
+        )
+        no_match = _edit_file_handler(
+            no_match_call,
+            EditFileArgs(file_path="missing.txt", old_text="x", new_text="y"),
+            WorkspaceContext(guard),
+        )
+
+    assert ambiguous.error is not None
+    assert ambiguous.error.code == "ambiguous_match"
+    assert no_match.error is not None
+    assert no_match.error.code == "no_match"
+    assert (tmp_path / "dup.txt").read_text(encoding="utf-8") == "foo foo\n"
+    assert not (tmp_path / "missing.txt").exists()
+
+
+def test_mutation_handlers_reject_wrong_arguments_and_context(tmp_path: Path) -> None:
+    write_call = ToolCall(
+        call_id="w-contract",
+        name="write_file",
+        arguments={"file_path": "x.txt", "content": "x"},
+    )
+    edit_call = ToolCall(
+        call_id="e-contract",
+        name="edit_file",
+        arguments={"file_path": "x.txt", "old_text": "a", "new_text": "b"},
+    )
+
+    wrong_write_args = _write_file_handler(write_call, BashArgs(command="id"), object())
+    wrong_write_ctx = _write_file_handler(
+        write_call, WriteFileArgs(file_path="x.txt", content="x"), object()
+    )
+    wrong_edit_args = _edit_file_handler(edit_call, BashArgs(command="id"), object())
+    wrong_edit_ctx = _edit_file_handler(
+        edit_call,
+        EditFileArgs(file_path="x.txt", old_text="a", new_text="b"),
+        object(),
+    )
+
+    for result in (wrong_write_args, wrong_edit_args):
+        assert result.error is not None
+        assert result.error.code == "invalid_arguments"
+    for result in (wrong_write_ctx, wrong_edit_ctx):
+        assert result.error is not None
+        assert result.error.code == "invalid_context"

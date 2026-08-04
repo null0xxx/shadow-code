@@ -232,11 +232,13 @@ class TestNativeToolAdmission(unittest.TestCase):
             for tools in payloads:
                 self.assertIsNotNone(tools)
                 names = [t["function"]["name"] for t in tools]
-                self.assertEqual(names, ["bash", "read_file"])
+                self.assertEqual(names, ["bash", "edit_file", "read_file", "write_file"])
 
             # System prompt uses the native section plus generated tool docs.
             self.assertNotIn("No executable tool protocol is active", prompts[0])
             self.assertIn("## read_file", prompts[0])
+            self.assertIn("## write_file", prompts[0])
+            self.assertIn("## edit_file", prompts[0])
             self.assertIn("## bash", prompts[0])
             self.assertNotIn("native_tools_unavailable", stdout.getvalue())
 
@@ -298,6 +300,126 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertIn("strict content", read_message["content"])
             self.assertIn("policy_denied", bash_message["content"])
             self.assertIn("bash disabled: strict mode", stdout.getvalue())
+
+    def test_mutation_strict_denies_write_file_but_allows_read_file(self):
+        import importlib
+        import tempfile
+
+        from shadow_code.conversation import Conversation
+        from shadow_code.policy.workspace import WorkspaceGuard
+
+        main_module = importlib.import_module("shadow_code.main")
+        native_calls = [
+            {"call_id": "call-0", "name": "read_file", "arguments": {"file_path": "hello.txt"}},
+            {
+                "call_id": "call-1",
+                "name": "write_file",
+                "arguments": {"file_path": "new.txt", "content": "denied\n"},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as workspace:
+            with open(os.path.join(workspace, "hello.txt"), "w", encoding="utf-8") as handle:
+                handle.write("strict content\n")
+
+            client = MagicMock()
+            client.health_check.return_value = (True, "OK")
+            client.last_prompt_tokens = 0
+            client.last_eval_tokens = 0
+            responses = iter((([], native_calls), (["finished"], [])))
+
+            def chat_stream(messages, system, model=None, tools=None):
+                chunks, client.last_tool_calls = next(responses)
+                return iter(chunks)
+
+            client.chat_stream.side_effect = chat_stream
+            conversation = Conversation()
+
+            with (
+                patch.object(main_module, "_RICH", False),
+                patch.object(main_module, "_HAS_REPL", False),
+                patch.object(main_module, "_HAS_DB", False),
+                patch.object(main_module, "MUTATION_STRICT", True),
+                patch.object(main_module, "OllamaClient", return_value=client),
+                patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(
+                    main_module,
+                    "WorkspaceGuard",
+                    side_effect=lambda root, **kw: WorkspaceGuard(workspace),
+                ),
+                patch.object(main_module, "_register_optional_tools"),
+                patch.object(main_module.tool_reg, "register"),
+                patch.object(main_module.signal, "signal"),
+                patch("builtins.input", side_effect=["run both", "/exit"]),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                main_module.main()
+
+            tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 2)
+            read_message = next(m for m in tool_messages if m["name"] == "read_file")
+            write_message = next(m for m in tool_messages if m["name"] == "write_file")
+            self.assertIn("strict content", read_message["content"])
+            self.assertIn("policy_denied", write_message["content"])
+            self.assertIn("file mutations disabled", stdout.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(workspace, "new.txt")))
+
+    def test_approved_write_file_call_lands_on_disk_through_main(self):
+        import importlib
+        import tempfile
+
+        from shadow_code.conversation import Conversation
+        from shadow_code.policy.workspace import WorkspaceGuard
+
+        main_module = importlib.import_module("shadow_code.main")
+        native_call = {
+            "call_id": "call-0",
+            "name": "write_file",
+            "arguments": {"file_path": "created.txt", "content": "approved content\n"},
+        }
+
+        with tempfile.TemporaryDirectory() as workspace:
+            client = MagicMock()
+            client.health_check.return_value = (True, "OK")
+            client.last_prompt_tokens = 0
+            client.last_eval_tokens = 0
+            responses = iter((([], [native_call]), (["finished"], [])))
+
+            def chat_stream(messages, system, model=None, tools=None):
+                chunks, client.last_tool_calls = next(responses)
+                return iter(chunks)
+
+            client.chat_stream.side_effect = chat_stream
+            conversation = Conversation()
+
+            # Inputs: user message, approval answer, exit.
+            with (
+                patch.object(main_module, "_RICH", False),
+                patch.object(main_module, "_HAS_REPL", False),
+                patch.object(main_module, "_HAS_DB", False),
+                patch.object(main_module, "OllamaClient", return_value=client),
+                patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(
+                    main_module,
+                    "WorkspaceGuard",
+                    side_effect=lambda root, **kw: WorkspaceGuard(workspace),
+                ),
+                patch.object(main_module, "_register_optional_tools"),
+                patch.object(main_module.tool_reg, "register"),
+                patch.object(main_module.signal, "signal"),
+                patch("builtins.input", side_effect=["create it", "y", "/exit"]),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                main_module.main()
+
+            with open(os.path.join(workspace, "created.txt"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "approved content\n")
+            tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertEqual(tool_messages[0]["name"], "write_file")
+            self.assertIn("before: missing", tool_messages[0]["content"])
+            self.assertIn("sha256=", tool_messages[0]["content"])
+            self.assertIn("mutation: write created.txt", stdout.getvalue())
 
 
 class TestAdmitNativeCalls(unittest.TestCase):
@@ -493,6 +615,193 @@ class TestAdmitNativeCalls(unittest.TestCase):
             registry = ToolRegistry((BASH_SPEC, READ_FILE_SPEC))
             engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
             calls = [{"call_id": "b2", "name": "bash", "arguments": {"command": "id"}}]
+            results = _admit_native_calls(
+                calls, registry, engine, WorkspaceContext(guard), ApprovalAuthority()
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "policy_denied")
+
+
+class TestMutationAdmission(unittest.TestCase):
+    """write_file/edit_file run only through plan, approval, and apply."""
+
+    def _mutation_admission(self):
+        import tempfile
+
+        from shadow_code.domain.policy import PolicyFacts
+        from shadow_code.domain.tools import Capability
+        from shadow_code.policy.engine import PolicyEngine
+        from shadow_code.policy.workspace import WorkspaceGuard
+        from shadow_code.tools.catalog import (
+            EDIT_FILE_SPEC,
+            READ_FILE_SPEC,
+            WRITE_FILE_SPEC,
+            WorkspaceContext,
+        )
+        from shadow_code.tools.registry import ToolRegistry
+
+        workspace = tempfile.TemporaryDirectory()
+        guard = WorkspaceGuard(workspace.name)
+        registry = ToolRegistry((READ_FILE_SPEC, WRITE_FILE_SPEC, EDIT_FILE_SPEC))
+        capabilities = {Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE}
+        engine = PolicyEngine(PolicyFacts(capabilities, guard.identity))
+        context = WorkspaceContext(guard=guard, workspace_root=workspace.name)
+        return workspace, guard, registry, engine, context
+
+    def test_approved_write_creates_file_and_records_digests(self):
+        import os
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        calls = [
+            {
+                "call_id": "w1",
+                "name": "write_file",
+                "arguments": {"file_path": "note.txt", "content": "exact bytes\n"},
+            }
+        ]
+        with workspace, guard, patch("builtins.input", return_value="y"):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+            with open(os.path.join(workspace.name, "note.txt"), encoding="utf-8") as handle:
+                written = handle.read()
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(written, "exact bytes\n")
+        self.assertIn("before: missing", results[0].output)
+        self.assertIn("after:  device=", results[0].output)
+        self.assertIn("sha256=", results[0].output)
+
+    def test_approved_edit_replaces_exact_text(self):
+        import os
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        with open(os.path.join(workspace.name, "code.py"), "w", encoding="utf-8") as handle:
+            handle.write("value = 1\n")
+        calls = [
+            {
+                "call_id": "e1",
+                "name": "edit_file",
+                "arguments": {"file_path": "code.py", "old_text": "1", "new_text": "2"},
+            }
+        ]
+        with workspace, guard, patch("builtins.input", return_value="y"):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+            with open(os.path.join(workspace.name, "code.py"), encoding="utf-8") as handle:
+                edited = handle.read()
+
+        self.assertTrue(results[0].success)
+        self.assertEqual(edited, "value = 2\n")
+
+    def test_denied_write_leaves_workspace_untouched(self):
+        import os
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        calls = [
+            {
+                "call_id": "w2",
+                "name": "write_file",
+                "arguments": {"file_path": "denied.txt", "content": "never\n"},
+            }
+        ]
+        with workspace, guard, patch("builtins.input", return_value="n"):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        self.assertFalse(results[0].success)
+        self.assertEqual(results[0].error.code, "approval_denied")
+        self.assertFalse(os.path.exists(os.path.join(workspace.name, "denied.txt")))
+
+    def test_mutation_plan_binds_preview_and_keeps_empty_execution_facts(self):
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        calls = [
+            {
+                "call_id": "w3",
+                "name": "write_file",
+                "arguments": {"file_path": "preview.txt", "content": "shown\n"},
+            }
+        ]
+        plans = []
+        with (
+            workspace,
+            guard,
+            patch(
+                "shadow_code.main._request_approval",
+                side_effect=TestAdmitNativeCalls._deny_and_capture(plans),
+            ),
+        ):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+
+        self.assertEqual(results[0].error.code, "approval_denied")
+        self.assertEqual(len(plans), 1)
+        plan = plans[0]
+        self.assertEqual(plan.execution_facts, "")
+        self.assertIn("mutation: write preview.txt", plan.preview)
+        self.assertIn("new file", plan.preview)
+
+    def test_ambiguous_edit_surfaces_typed_result_without_approval_prompt(self):
+        import os
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.main import _admit_native_calls
+
+        workspace, guard, registry, engine, context = self._mutation_admission()
+        with open(os.path.join(workspace.name, "dup.txt"), "w", encoding="utf-8") as handle:
+            handle.write("foo foo\n")
+        calls = [
+            {
+                "call_id": "e2",
+                "name": "edit_file",
+                "arguments": {"file_path": "dup.txt", "old_text": "foo", "new_text": "bar"},
+            }
+        ]
+        with (
+            workspace,
+            guard,
+            patch("shadow_code.main._request_approval") as approval,
+        ):
+            results = _admit_native_calls(calls, registry, engine, context, ApprovalAuthority())
+            with open(os.path.join(workspace.name, "dup.txt"), encoding="utf-8") as handle:
+                untouched = handle.read()
+
+        approval.assert_not_called()
+        self.assertEqual(results[0].error.code, "ambiguous_match")
+        self.assertEqual(untouched, "foo foo\n")
+
+    def test_ungranted_write_capability_is_a_typed_policy_denial(self):
+        import tempfile
+
+        from shadow_code.domain.approval import ApprovalAuthority
+        from shadow_code.domain.policy import PolicyFacts
+        from shadow_code.domain.tools import Capability
+        from shadow_code.main import _admit_native_calls
+        from shadow_code.policy.engine import PolicyEngine
+        from shadow_code.policy.workspace import WorkspaceGuard
+        from shadow_code.tools.catalog import READ_FILE_SPEC, WRITE_FILE_SPEC, WorkspaceContext
+        from shadow_code.tools.registry import ToolRegistry
+
+        with tempfile.TemporaryDirectory() as workspace, WorkspaceGuard(workspace) as guard:
+            registry = ToolRegistry((READ_FILE_SPEC, WRITE_FILE_SPEC))
+            engine = PolicyEngine(PolicyFacts({Capability.FILESYSTEM_READ}, guard.identity))
+            calls = [
+                {
+                    "call_id": "w4",
+                    "name": "write_file",
+                    "arguments": {"file_path": "x.txt", "content": "x"},
+                }
+            ]
             results = _admit_native_calls(
                 calls, registry, engine, WorkspaceContext(guard), ApprovalAuthority()
             )
