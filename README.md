@@ -68,7 +68,8 @@ responses. The current default runtime supports:
 
 Read-only native tool calls (`read_file`) execute through the admission pipeline: registry
 validation, then policy, then a contained executor. Calls with side effects or unknown
-effects (`bash`) require an interactive one-shot approval: Shadow Code shows the exact
+effects (`bash`, `write_file`, `edit_file`) require an interactive one-shot approval:
+Shadow Code shows the exact
 action plan (tool, version, capability, arguments, workspace, digest) and executes only
 after an explicit `y`. The approval token is bound to the action-plan digest, authorizes
 exactly one execution, and is burned by any mismatch — changed arguments, workspace, tool
@@ -93,6 +94,41 @@ Strict mode denies shell execution entirely when no kernel sandboxing
 
 ```bash
 SHADOW_BASH_STRICT=1 .venv/bin/shadow-code
+```
+
+### File mutations (`write_file` / `edit_file`)
+
+File changes go through the same admission pipeline as every other call — there is no
+append or write path that bypasses read, preview, and policy. `write_file` replaces a
+file's full content; `edit_file` replaces exact text and fails closed unless the text
+matches EXACTLY ONCE (zero matches report `no_match`, duplicate matches report
+`ambiguous_match` and nothing is written). Both require a fresh interactive one-shot
+approval bound to the exact arguments and a previewed unified diff, and every mutation
+consumes its own approval.
+
+An approved mutation is applied atomically under the declared stable-workspace /
+cooperative-writer threat model:
+
+- the new content is written to a temp file in the target directory, fsynced, and given
+  the existing file's mode (new files get `0o644`); all opens, temp creation, and the
+  final rename are descriptor-relative and no-follow beneath the pinned workspace root;
+- immediately before the commit, the target is re-snapshotted and compared against the
+  approved plan — any change in identity, content, mode, or presence aborts with the
+  original intact and the temp file removed;
+- the rename plus a directory fsync complete the commit, and a post-write readback
+  verifies the landed digest; the result records before/after identities and SHA-256
+  digests.
+
+Cooperating Shadow Code writers serialize their commits on a per-workspace lock
+(`.shadow-code.lock`). This lock is **cooperative only**: it is honored solely by
+Shadow Code writers that voluntarily take it and is **not a security boundary** — it
+offers no protection against uncooperative or hostile processes.
+
+Strict mode withholds the filesystem-write capability entirely, so policy denies
+`write_file`/`edit_file` with `CAPABILITY_NOT_GRANTED` while reads keep working:
+
+```bash
+SHADOW_MUTATION_STRICT=1 .venv/bin/shadow-code
 ```
 
 ### Legacy Markdown tools (compatibility only)
@@ -173,6 +209,8 @@ and text responses, but commands that require file or shell tools cannot execute
 | `SHADOW_MODEL` | `shadow-gemma:latest` | Ollama model to use |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API URL |
 | `SHADOW_LEGACY_MARKDOWN_TOOLS` | disabled | Opt in to the unsafe compatibility tool path |
+| `SHADOW_BASH_STRICT` | disabled | Deny shell execution when no kernel sandbox is available |
+| `SHADOW_MUTATION_STRICT` | disabled | Withhold the filesystem-write capability entirely |
 
 ## Architecture
 

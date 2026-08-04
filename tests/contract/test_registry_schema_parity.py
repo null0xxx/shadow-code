@@ -15,7 +15,9 @@ def test_default_registry_provider_and_prompt_schema_parity() -> None:
 
     assert [item["function"]["name"] for item in envelopes] == [
         "bash",
+        "edit_file",
         "read_file",
+        "write_file",
     ]
     assert documentation.index("## bash") < documentation.index("## read_file")
     for spec, envelope in zip(DEFAULT_TOOL_REGISTRY.specs, envelopes, strict=True):
@@ -44,7 +46,9 @@ def test_default_registry_provider_and_prompt_schema_parity() -> None:
 def test_canonical_examples_validate_without_execution() -> None:
     examples = {
         "bash": {"command": "printf ok"},
+        "edit_file": {"file_path": "docs/example", "old_text": "a", "new_text": "b"},
         "read_file": {"file_path": "docs/example", "offset": 1, "limit": 10},
+        "write_file": {"file_path": "docs/example", "content": "text"},
     }
 
     for call_id, (name, arguments) in enumerate(examples.items()):

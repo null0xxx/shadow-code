@@ -11,11 +11,14 @@
 #
 # Falls back to plain-text mode if rich/prompt_toolkit not installed.
 
+import json
 import os
 import platform
 import signal
 import sys
 from datetime import datetime
+
+from pydantic import ValidationError
 
 from . import tools as tool_reg
 from .config import (
@@ -26,6 +29,7 @@ from .config import (
     MAX_NATIVE_TOOL_TURNS,
     MAX_TOOL_TURNS,
     MODEL_NAME,
+    MUTATION_STRICT,
 )
 from .conversation import Conversation
 from .display import TAG_START, StreamDisplay
@@ -36,8 +40,9 @@ from .domain.approval import (
     render_action_preview,
 )
 from .domain.policy import PolicyDisposition, PolicyFacts, WorkspaceAccessError
-from .domain.tools import Capability, ToolError, ToolResult
+from .domain.tools import Capability, ToolError, ToolResult, ValidatedToolCall
 from .executor import execute_validated_call
+from .mutation import MutationError, MutationPlan, build_edit_plan, build_write_plan
 from .ollama_client import OllamaClient, render_ollama_tool_schemas
 from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
 from .policy.engine import PolicyEngine
@@ -47,7 +52,15 @@ from .prompt import render_system_prompt, render_tool_documentation
 from .safety import check_destructive
 from .skills import get_skill, list_skills
 from .tool_context import ToolContext
-from .tools.catalog import BASH_SPEC, READ_FILE_SPEC, WorkspaceContext
+from .tools.catalog import (
+    BASH_SPEC,
+    EDIT_FILE_SPEC,
+    READ_FILE_SPEC,
+    WRITE_FILE_SPEC,
+    EditFileArgs,
+    WorkspaceContext,
+    WriteFileArgs,
+)
 from .tools.registry import ToolRegistry
 
 # Optional imports -- graceful fallback
@@ -98,17 +111,56 @@ def _legacy_markdown_protocol_error(
     )
 
 
-def _granted_capabilities(strict: bool, sandbox_label: str) -> frozenset[Capability]:
-    """Granted capabilities; strict mode withholds shell without a sandbox.
+def _granted_capabilities(
+    bash_strict: bool, sandbox_label: str, mutation_strict: bool
+) -> frozenset[Capability]:
+    """Granted capabilities; strict modes withhold shell and file writes.
 
-    Strict mode denies shell execution entirely when no kernel sandboxing
-    (bwrap/firejail) is available; the policy engine then rejects bash with
-    CAPABILITY_NOT_GRANTED instead of running it unconfined.
+    Bash strict mode denies shell execution entirely when no kernel
+    sandboxing (bwrap/firejail) is available; the policy engine then rejects
+    bash with CAPABILITY_NOT_GRANTED instead of running it unconfined.
+    Mutation strict mode withholds FILESYSTEM_WRITE unconditionally, so
+    write_file/edit_file are denied by policy in the same way.
     """
-    granted = {Capability.FILESYSTEM_READ, Capability.PROCESS_EXECUTE}
-    if strict and sandbox_label == "unconfined":
+    granted = {
+        Capability.FILESYSTEM_READ,
+        Capability.FILESYSTEM_WRITE,
+        Capability.PROCESS_EXECUTE,
+    }
+    if bash_strict and sandbox_label == "unconfined":
         granted.discard(Capability.PROCESS_EXECUTE)
+    if mutation_strict:
+        granted.discard(Capability.FILESYSTEM_WRITE)
     return frozenset(granted)
+
+
+def _mutation_plan_for_call(
+    validated: ValidatedToolCall, context: WorkspaceContext
+) -> MutationPlan | ToolError:
+    """Build the pure mutation plan for an approval preview; fail typed.
+
+    The preview is built from a snapshot taken at approval time. The handler
+    re-plans and re-snapshots at execution time, and apply_mutation re-checks
+    the snapshot immediately before the commit, so any drift between preview
+    and execution aborts with the original intact.
+    """
+    try:
+        raw_arguments = json.loads(validated.canonical_arguments_json())
+        arguments = validated.spec.args_model.model_validate(raw_arguments, strict=True)
+        if isinstance(arguments, WriteFileArgs):
+            return build_write_plan(context.guard, arguments)
+        if isinstance(arguments, EditFileArgs):
+            return build_edit_plan(context.guard, arguments)
+        return ToolError(
+            code="unsupported_mutation",
+            message=f"Tool '{validated.call.name}' has no mutation planner.",
+        )
+    except MutationError as error:
+        return ToolError(code=error.code, message=str(error))
+    except WorkspaceAccessError as error:
+        return ToolError(code=error.reason.value, message=str(error))
+    except ValidationError as error:
+        return ToolError(code="invalid_arguments", message=str(error))
 
 
 def _request_approval(plan: ActionPlan) -> bool:
@@ -198,6 +250,23 @@ def _admit_native_calls(
                     f" (no confinement; approval is the only control)"
                     f"\nfeatures: {', '.join(features) if features else 'none detected'}"
                 )
+            elif validated.spec.capability is Capability.FILESYSTEM_WRITE:
+                mutation_plan = _mutation_plan_for_call(validated, execution_context)
+                if isinstance(mutation_plan, ToolError):
+                    # Plan-build failures (no_match, ambiguous_match, ...)
+                    # surface as typed results, never as approval prompts.
+                    results.append(
+                        ToolResult(
+                            call_id=validated.call.call_id,
+                            tool_name=validated.call.name,
+                            error=mutation_plan,
+                        )
+                    )
+                    continue
+                preview += (
+                    f"\nmutation: {mutation_plan.operation} "
+                    f"{mutation_plan.relative_path}\n{mutation_plan.preview}"
+                )
             plan = build_action_plan(
                 validated,
                 registry_digest=registry.digest,
@@ -240,15 +309,18 @@ def main():
     # bash executes UNCONFINED after an explicit one-shot approval bound to
     # the exact command, workspace, environment digest, and sandbox facts;
     # strict mode withholds the capability when no sandbox is available.
+    # write_file/edit_file mutate only after an explicit one-shot approval
+    # bound to the exact arguments and previewed diff; mutation strict mode
+    # withholds the FILESYSTEM_WRITE capability entirely.
     try:
         workspace_guard = WorkspaceGuard(cwd)
     except WorkspaceAccessError as e:
         print(f"Error: cannot establish workspace containment: {e}", file=sys.stderr)
         sys.exit(1)
-    runtime_registry = ToolRegistry((READ_FILE_SPEC, BASH_SPEC))
+    runtime_registry = ToolRegistry((READ_FILE_SPEC, WRITE_FILE_SPEC, EDIT_FILE_SPEC, BASH_SPEC))
     process_env = build_process_env()
     sandbox_label = detect_sandbox()
-    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label, MUTATION_STRICT)
     policy_engine = PolicyEngine(PolicyFacts(capabilities, workspace_guard.identity))
     execution_context = WorkspaceContext(
         guard=workspace_guard,
@@ -260,6 +332,8 @@ def main():
         print("[bash disabled: strict mode and no sandbox (bwrap/firejail) available]")
     else:
         print("[bash runs UNCONFINED; every execution requires explicit approval]")
+    if Capability.FILESYSTEM_WRITE not in capabilities:
+        print("[file mutations disabled: SHADOW_MUTATION_STRICT is set]")
     approval_authority = ApprovalAuthority()
     tool_schemas = render_ollama_tool_schemas(runtime_registry)
     system_prompt = render_system_prompt(
