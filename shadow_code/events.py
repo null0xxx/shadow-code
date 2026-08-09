@@ -118,6 +118,19 @@ class ImportedMessagePayload(FrozenModel):
     timestamp: str
 
 
+class ContextSnapshotPayload(FrozenModel):
+    """Compaction summary over a closed range of causal groups (WU-08)."""
+
+    covered_seq_start: int
+    covered_seq_end: int
+    covered_group_count: int
+    covered_event_ids_digest: str
+    source_digest: str
+    summary_text: str
+    referenced_paths: tuple[str, ...]
+    created_utc: str
+
+
 _PAYLOAD_MODELS: dict[str, type[FrozenModel]] = {
     "session_started": SessionStartedPayload,
     "user_message": UserMessagePayload,
@@ -131,6 +144,7 @@ _PAYLOAD_MODELS: dict[str, type[FrozenModel]] = {
     "turn_completed": TurnCompletedPayload,
     "session_ended": SessionEndedPayload,
     "imported_message": ImportedMessagePayload,
+    "context_snapshot": ContextSnapshotPayload,
 }
 
 # Event types that close a proposed tool call.
@@ -194,6 +208,57 @@ class PendingToolCall:
     name: str
     proposed_utc: str
     plan_digest: str | None
+
+
+def project_events(events: Iterable[Event]) -> list[dict]:
+    """Project an event sequence into provider-shaped messages.
+
+    Consecutive tool_call_proposed events form one assistant message
+    with a tool_calls list, mirroring Conversation.add_assistant_tool_call;
+    each tool_result becomes one tool-role message, mirroring
+    Conversation.add_native_tool_result. Corrupt or unknown events fail
+    typed; use verify() for non-fatal diagnostics. Policy, approval,
+    turn, session, and snapshot events carry no transcript message.
+    """
+    messages: list[dict] = []
+    proposed: list[dict] = []
+
+    def flush_proposed() -> None:
+        if proposed:
+            messages.append({"role": "assistant", "content": "", "tool_calls": list(proposed)})
+            proposed.clear()
+
+    for event in events:
+        if event.type == "tool_call_proposed":
+            proposal = cast(ToolCallProposedPayload, event.parse_payload())
+            proposed.append(
+                {
+                    "call_id": proposal.call_id,
+                    "name": proposal.name,
+                    "arguments": json.loads(proposal.arguments_json),
+                }
+            )
+            continue
+        payload = event.parse_payload()
+        if isinstance(payload, UserMessagePayload):
+            flush_proposed()
+            messages.append({"role": "user", "content": payload.content})
+        elif isinstance(payload, ImportedMessagePayload):
+            flush_proposed()
+            messages.append({"role": payload.role, "content": payload.content})
+        elif isinstance(payload, AssistantTextPayload):
+            flush_proposed()
+            messages.append({"role": "assistant", "content": payload.content})
+        elif isinstance(payload, ToolResultPayload):
+            flush_proposed()
+            if payload.ok:
+                content = payload.output or ""
+            else:
+                content = f"[{payload.error_code}] {payload.error_message}"
+            messages.append({"role": "tool", "content": content, "name": payload.tool_name})
+        # policy/approval/turn/session/snapshot events carry no transcript message.
+    flush_proposed()
+    return messages
 
 
 def default_events_db_path() -> Path:
@@ -344,51 +409,9 @@ class EventStore:
     def rebuild_transcript(self, session_id: str) -> list[dict]:
         """Project events back into provider-shaped messages.
 
-        Consecutive tool_call_proposed events form one assistant message
-        with a tool_calls list, mirroring Conversation.add_assistant_tool_call;
-        each tool_result becomes one tool-role message, mirroring
-        Conversation.add_native_tool_result. Corrupt or unknown events fail
-        typed; use verify() for non-fatal diagnostics.
+        Thin wrapper over project_events for the full session history.
         """
-        messages: list[dict] = []
-        proposed: list[dict] = []
-
-        def flush_proposed() -> None:
-            if proposed:
-                messages.append({"role": "assistant", "content": "", "tool_calls": list(proposed)})
-                proposed.clear()
-
-        for event in self.events_for(session_id):
-            if event.type == "tool_call_proposed":
-                proposal = cast(ToolCallProposedPayload, event.parse_payload())
-                proposed.append(
-                    {
-                        "call_id": proposal.call_id,
-                        "name": proposal.name,
-                        "arguments": json.loads(proposal.arguments_json),
-                    }
-                )
-                continue
-            payload = event.parse_payload()
-            if isinstance(payload, UserMessagePayload):
-                flush_proposed()
-                messages.append({"role": "user", "content": payload.content})
-            elif isinstance(payload, ImportedMessagePayload):
-                flush_proposed()
-                messages.append({"role": payload.role, "content": payload.content})
-            elif isinstance(payload, AssistantTextPayload):
-                flush_proposed()
-                messages.append({"role": "assistant", "content": payload.content})
-            elif isinstance(payload, ToolResultPayload):
-                flush_proposed()
-                if payload.ok:
-                    content = payload.output or ""
-                else:
-                    content = f"[{payload.error_code}] {payload.error_message}"
-                messages.append({"role": "tool", "content": content, "name": payload.tool_name})
-            # policy/approval/turn/session events carry no transcript message.
-        flush_proposed()
-        return messages
+        return project_events(self.events_for(session_id))
 
     def pending_tool_calls(self, session_id: str) -> list[PendingToolCall]:
         """Proposed calls with no terminal result, in proposal order."""

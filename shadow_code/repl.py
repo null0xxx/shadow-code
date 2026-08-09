@@ -38,6 +38,7 @@ _SLASH_COMMANDS = [
     "/info",
     "/skills",
     "/compact",
+    "/context",
     "/version",
     "/history",
     "/cd",

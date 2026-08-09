@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import cast
 
@@ -33,7 +34,18 @@ from .config import (
     MODEL_NAME,
     MUTATION_STRICT,
 )
-from .conversation import Conversation
+from .context_compaction import (
+    CompactionError,
+    active_snapshot,
+    append_context_snapshot,
+    build_provider_messages,
+    build_snapshot,
+    context_diagnostics,
+    group_events,
+    select_closed_range,
+    validate_snapshot,
+)
+from .conversation import COMPACTION_RATIO, Conversation
 from .display import TAG_START, StreamDisplay
 from .domain.approval import ActionPlan, ApprovalAuthority
 from .domain.policy import PolicyFacts, WorkspaceAccessError
@@ -56,6 +68,7 @@ from .events import (
     TurnCompletedPayload,
     UserMessagePayload,
     default_events_db_path,
+    project_events,
 )
 from .ollama_client import OllamaClient, render_ollama_tool_schemas
 from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
@@ -364,6 +377,90 @@ def _handle_prompt_command(user_input: str, manager: PromptManager) -> None:
         print(f"  prompt {sub or '?'} failed [{exc.code}]: {exc.message}")
 
 
+def _summarize_with_model(client: OllamaClient, messages: list[dict], system_prompt: str) -> str:
+    """Summarize messages through the existing LLM compaction path."""
+    from .compaction import compact
+
+    return compact(client, messages, system_prompt)
+
+
+def _compact_from_events(
+    store: EventStore,
+    session_id: str,
+    conv: Conversation,
+    workspace_guard: WorkspaceGuard,
+    summarize: Callable[[list[dict]], str],
+) -> str:
+    """Event-sourced /compact (WU-08): snapshot a closed range of complete
+    causal groups, then rebuild the live conversation from the projection.
+
+    Fail-closed: any summarizer failure, validation issue, or overlap is
+    raised BEFORE the snapshot is appended and BEFORE the conversation is
+    touched. The event log is never modified -- one context_snapshot event
+    is appended; the original events stay queryable.
+    """
+    events = store.events_for(session_id)
+    groups = group_events(events)
+    active = active_snapshot(store, session_id)
+    snapshot_event_ids = {event.event_id for event in events if event.type == "context_snapshot"}
+    eligible = [
+        group
+        for group in groups
+        if (active is None or group.seq_start > active.covered_seq_end)
+        and not any(event_id in snapshot_event_ids for event_id in group.event_ids)
+    ]
+    budget = int(CONTEXT_WINDOW * COMPACTION_RATIO)
+    selected = select_closed_range(eligible, budget)
+    if not selected:
+        raise CompactionError("nothing_to_compact", "no complete groups beyond the active snapshot")
+    by_id = {event.event_id: event for event in events}
+    covered_events = [by_id[event_id] for group in selected for event_id in group.event_ids]
+    summary_text = summarize(project_events(covered_events))
+    snapshot = build_snapshot(session_id, selected, summary_text)
+    issues = validate_snapshot(snapshot, selected, workspace_guard)
+    if issues:
+        raise CompactionError("snapshot_invalid", "; ".join(issues))
+    append_context_snapshot(store, snapshot)
+    messages = build_provider_messages(store, session_id)
+    tokens_before = conv.total_prompt_tokens
+    conv.messages = messages
+    tokens_after = max(1, sum(len(str(message.get("content", ""))) for message in messages) // 4)
+    conv.update_tokens(tokens_after)
+    return (
+        f"[Compacted: {len(selected)} group(s) summarized, "
+        f"~{tokens_before} -> ~{tokens_after} tokens; original events retained]"
+    )
+
+
+def _show_context_diagnostics(store: EventStore, session_id: str) -> None:
+    """Print context_diagnostics for the /context command."""
+    diag = context_diagnostics(store, session_id)
+    kinds = diag["groups_by_kind"]
+    print(
+        f"  events: {diag['total_events']}  groups: {diag['groups_total']} "
+        f"(messages {kinds['message']}, tool calls {kinds['tool_call']})"
+    )
+    print(
+        f"  terminal: {diag['terminal_groups']}  pending: {diag['pending_groups']}  "
+        f"~{diag['estimated_uncovered_tokens']} uncovered tokens"
+    )
+    snapshot = diag["active_snapshot"]
+    if snapshot is None:
+        print("  snapshot: none")
+    else:
+        print(
+            f"  snapshot: seq {snapshot['covered_seq_start']}-"
+            f"{snapshot['covered_seq_end']} ({snapshot['covered_group_count']} "
+            f"groups, {snapshot['covered_group_percent']}% covered)"
+        )
+        print(
+            f"  digests: source {snapshot['source_digest'][:12]}  "
+            f"events {snapshot['covered_event_ids_digest'][:12]}"
+        )
+    for issue in diag["issues"]:
+        print(f"  issue: {issue}")
+
+
 def main():
     cwd = os.getcwd()
     ctx = ToolContext(cwd)
@@ -502,7 +599,7 @@ def main():
         print(f"[events warning: {e}]")
         event_store = None
 
-    print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt /events\n")
+    print("Commands: /help /clear /exit /tokens /save /load /list /info /prompt /events /context\n")
 
     conv = Conversation()
     interrupted = False
@@ -670,7 +767,29 @@ def main():
             continue
 
         if user_input == "/compact":
-            if conv.total_prompt_tokens > 0:
+            if event_store is not None and event_session_id:
+                # WU-08: snapshot complete causal groups via the event store;
+                # the legacy message-level path remains for a degraded store.
+                try:
+                    line = _compact_from_events(
+                        event_store,
+                        event_session_id,
+                        conv,
+                        workspace_guard,
+                        lambda messages, prompt=system_prompt: _summarize_with_model(
+                            client, messages, prompt
+                        ),
+                    )
+                except CompactionError as e:
+                    if e.code == "nothing_to_compact":
+                        print(f"  {e.message}")
+                    else:
+                        print(f"[Compaction failed ({e.code}): {e.message}]")
+                except Exception as e:
+                    print(f"[Compaction failed: {e}]")
+                else:
+                    print(line)
+            elif conv.total_prompt_tokens > 0:
                 print("[Compacting conversation...]")
                 try:
                     from .compaction import compact
@@ -684,6 +803,13 @@ def main():
                 print("  Nothing to compact")
             continue
 
+        if user_input == "/context":
+            if event_store is not None and event_session_id:
+                _show_context_diagnostics(event_store, event_session_id)
+            else:
+                print("  [event store not available]")
+            continue
+
         if user_input == "/help":
             cmds = [
                 ("/help", "Show this help"),
@@ -692,7 +818,8 @@ def main():
                 ("/tokens", "Show context usage"),
                 ("/info", "Show session info"),
                 ("/cd [path]", "Show or change working directory"),
-                ("/compact", "Manually compact conversation"),
+                ("/compact", "Compact complete context groups into a snapshot"),
+                ("/context", "Show context diagnostics"),
                 ("/history", "Show last 10 messages"),
                 ("/version", "Show version info"),
                 ("/save [name]", "Save session"),
