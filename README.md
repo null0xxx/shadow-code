@@ -96,6 +96,28 @@ Strict mode denies shell execution entirely when no kernel sandboxing
 SHADOW_BASH_STRICT=1 .venv/bin/shadow-code
 ```
 
+### Agent engine (bounded turns)
+
+Multi-step tool work is driven by a bounded engine (`shadow_code/engine.py`) with
+explicit states — `STREAMING`, `COLLECTING`, `ADMITTING`, `AWAITING_APPROVAL`,
+`EXECUTING` — and exactly one terminal outcome per turn: `COMPLETED`, `CANCELLED`,
+`FAILED`, or `BUDGET_EXHAUSTED` with a typed reason (`budget_steps`,
+`budget_calls`, `budget_time`, `budget_output`, `duplicates`). The engine never
+prints or reads input: streaming, approval consent, cancellation, and round
+reporting are injected seams, so the same admission pipeline (registry
+validation, policy, one-shot approval, contained execution) runs without any UI
+dependency. Every proposed call reaches exactly one terminal result, a denial is
+final and never retried, and a transient provider failure retries the round
+exactly once before failing.
+
+Per-turn budgets bound the work: native rounds (default 4), total calls, wall
+clock, and aggregate result output. The same call (name + canonical arguments)
+may repeat at most twice per turn — a third occurrence is not executed and ends
+the turn as `duplicates`. Cancellation is checked before every state
+transition: no further handler runs once requested, and a `KeyboardInterrupt`
+inside a handler (which already kills its process group) becomes a `CANCELLED`
+outcome, never a silent re-execution.
+
 ### File mutations (`write_file` / `edit_file`)
 
 File changes go through the same admission pipeline as every other call — there is no

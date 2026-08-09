@@ -12,7 +12,6 @@
 # Falls back to plain-text mode if rich/prompt_toolkit not installed.
 
 import difflib
-import json
 import os
 import platform
 import shlex
@@ -21,8 +20,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime
-
-from pydantic import ValidationError
+from typing import cast
 
 from . import tools as tool_reg
 from .config import (
@@ -37,38 +35,33 @@ from .config import (
 )
 from .conversation import Conversation
 from .display import TAG_START, StreamDisplay
-from .domain.approval import (
-    ActionPlan,
-    ApprovalAuthority,
-    build_action_plan,
-    render_action_preview,
+from .domain.approval import ActionPlan, ApprovalAuthority
+from .domain.policy import PolicyFacts, WorkspaceAccessError
+from .domain.tools import Capability, ToolError, ToolResult
+from .engine import (
+    AgentEngine,
+    EngineRound,
+    EngineState,
+    ProviderRound,
+    StreamCancelledError,
+    StreamError,
 )
-from .domain.policy import PolicyDisposition, PolicyFacts, WorkspaceAccessError
-from .domain.tools import Capability, ToolError, ToolResult, ValidatedToolCall
 from .events import (
-    ApprovalDeniedPayload,
-    ApprovalGrantedPayload,
-    ApprovalRequestedPayload,
     AssistantTextPayload,
     EventStore,
     EventStoreError,
     NewEvent,
-    PolicyDecisionPayload,
     SessionEndedPayload,
     SessionStartedPayload,
-    ToolCallProposedPayload,
-    ToolResultPayload,
     TurnCompletedPayload,
     UserMessagePayload,
     default_events_db_path,
 )
-from .executor import execute_validated_call
-from .mutation import MutationError, MutationPlan, build_edit_plan, build_write_plan
 from .ollama_client import OllamaClient, render_ollama_tool_schemas
 from .parser import LegacyMarkdownToolCall, parse_legacy_markdown_tool_calls
 from .policy.engine import PolicyEngine
 from .policy.workspace import WorkspaceGuard
-from .process import build_process_env, classify_command, detect_sandbox, execution_facts
+from .process import build_process_env, detect_sandbox
 from .prompt_compiler import (
     CompiledPrompt,
     PromptCompileError,
@@ -86,9 +79,7 @@ from .tools.catalog import (
     EDIT_FILE_SPEC,
     READ_FILE_SPEC,
     WRITE_FILE_SPEC,
-    EditFileArgs,
     WorkspaceContext,
-    WriteFileArgs,
 )
 from .tools.registry import ToolRegistry
 
@@ -160,35 +151,6 @@ def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Ca
     return frozenset(granted)
 
 
-def _mutation_plan_for_call(
-    validated: ValidatedToolCall, context: WorkspaceContext
-) -> MutationPlan | ToolError:
-    """Build the pure mutation plan for an approval preview; fail typed.
-
-    The preview is built from a snapshot taken at approval time. The handler
-    re-plans and re-snapshots at execution time, and apply_mutation re-checks
-    the snapshot immediately before the commit, so any drift between preview
-    and execution aborts with the original intact.
-    """
-    try:
-        raw_arguments = json.loads(validated.canonical_arguments_json())
-        arguments = validated.spec.args_model.model_validate(raw_arguments, strict=True)
-        if isinstance(arguments, WriteFileArgs):
-            return build_write_plan(context.guard, arguments)
-        if isinstance(arguments, EditFileArgs):
-            return build_edit_plan(context.guard, arguments)
-        return ToolError(
-            code="unsupported_mutation",
-            message=f"Tool '{validated.call.name}' has no mutation planner.",
-        )
-    except MutationError as error:
-        return ToolError(code=error.code, message=str(error))
-    except WorkspaceAccessError as error:
-        return ToolError(code=error.reason.value, message=str(error))
-    except ValidationError as error:
-        return ToolError(code="invalid_arguments", message=str(error))
-
-
 def _request_approval(plan: ActionPlan) -> bool:
     """Render the action plan and ask for a one-shot interactive approval.
 
@@ -210,14 +172,6 @@ def _request_approval(plan: ActionPlan) -> bool:
     return answer == "y"
 
 
-def _canonical_json(value: object) -> str:
-    """Serialize tool-call arguments deterministically; tolerate odd values."""
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        return json.dumps(value, ensure_ascii=False, default=str)
-
-
 def _emit(store: EventStore | None, session_id: str, events: list[NewEvent]) -> None:
     """Append events; a store failure degrades to a warning, never a crash."""
     if store is None or not events:
@@ -229,51 +183,6 @@ def _emit(store: EventStore | None, session_id: str, events: list[NewEvent]) -> 
             store.append_group(session_id, events)
     except (EventStoreError, OSError) as e:
         print(f"[events warning: {e}]")
-
-
-def _proposal_events(native_calls: list[dict]) -> list[NewEvent]:
-    """One tool_call_proposed event per raw call, in proposal order."""
-    events = []
-    for raw_call in native_calls:
-        if isinstance(raw_call, dict):
-            call_id = str(raw_call.get("call_id") or "invalid-call")
-            name = str(raw_call.get("name") or "unknown")
-            arguments = raw_call.get("arguments")
-        else:
-            call_id, name, arguments = "invalid-call", "unknown", None
-        events.append(
-            NewEvent(
-                "tool_call_proposed",
-                ToolCallProposedPayload(
-                    call_id=call_id,
-                    name=name,
-                    arguments_json=_canonical_json(arguments),
-                ),
-            )
-        )
-    return events
-
-
-def _result_event(result: ToolResult) -> NewEvent:
-    """The terminal tool_result event for an admission outcome."""
-    return NewEvent(
-        "tool_result",
-        ToolResultPayload(
-            call_id=result.call_id,
-            tool_name=result.tool_name,
-            ok=result.success,
-            output=result.output,
-            error_code=result.error.code if result.error else None,
-            error_message=result.error.message if result.error else None,
-        ),
-    )
-
-
-def _decision_event(call_id: str, disposition: str, reason: str) -> NewEvent:
-    return NewEvent(
-        "policy_decision",
-        PolicyDecisionPayload(call_id=call_id, disposition=disposition, reason=reason),
-    )
 
 
 def _resolve_pending_events(store: EventStore) -> bool:
@@ -318,172 +227,24 @@ def _admit_native_calls(
     event_store: EventStore | None = None,
     event_session_id: str = "",
 ) -> list[ToolResult]:
-    """Run collected native calls through validate -> policy -> execute.
+    """Compatibility wrapper: one admission pass through the bounded engine.
 
     Fail-closed at every step: invalid envelopes, unregistered tools, and
     policy denials produce typed error results and never reach a handler.
     Approval-required calls ask interactively for a one-shot, digest-bound
     token; denial or cancellation is final and the call is not retried.
-
-    When an event store is attached, every causal step is appended:
-    policy decisions, approval requests/grants/denials, and the terminal
-    result. Terminal groups (denial + result, grant + result) append
-    atomically; an allow decision and its result append separately so a
-    crash between them stays detectable as pending on resume.
     """
-    results = []
-    for raw_call in native_calls:
-        validated = registry.validate_call(raw_call)
-        if isinstance(validated, ToolError):
-            fallback_id = raw_call.get("call_id") if isinstance(raw_call, dict) else None
-            fallback_name = raw_call.get("name") if isinstance(raw_call, dict) else None
-            result = ToolResult(
-                call_id=fallback_id or "invalid-call",
-                tool_name=fallback_name or "unknown",
-                error=validated,
-            )
-            _emit(event_store, event_session_id, [_result_event(result)])
-            results.append(result)
-            continue
-
-        call_id = validated.call.call_id
-        decision = policy_engine.decide(validated)
-        if decision.disposition is PolicyDisposition.ALLOW:
-            _emit(
-                event_store,
-                event_session_id,
-                [_decision_event(call_id, "allow", decision.reason.value)],
-            )
-            result = execute_validated_call(validated, execution_context)
-            _emit(event_store, event_session_id, [_result_event(result)])
-            results.append(result)
-        elif decision.disposition is PolicyDisposition.DENY:
-            result = ToolResult(
-                call_id=call_id,
-                tool_name=validated.call.name,
-                error=ToolError(
-                    code="policy_denied",
-                    message=f"Policy denied execution ({decision.reason.value}).",
-                ),
-            )
-            _emit(
-                event_store,
-                event_session_id,
-                [
-                    _decision_event(call_id, "deny", decision.reason.value),
-                    _result_event(result),
-                ],
-            )
-            results.append(result)
-        else:
-            preview = render_action_preview(validated)
-            facts = ""
-            if validated.spec.capability is Capability.PROCESS_EXECUTE:
-                facts = execution_facts(
-                    execution_context.process_env,
-                    execution_context.workspace_root,
-                    execution_context.sandbox_label,
-                )
-                command = str(validated.arguments.get("command", ""))
-                features = sorted(classify_command(command))
-                sandbox_label = execution_context.sandbox_label
-                if sandbox_label == "unconfined":
-                    sandbox_line = "sandbox: unconfined (no sandbox helper available)"
-                else:
-                    sandbox_line = (
-                        f"sandbox: unconfined ({sandbox_label} available but not applied)"
-                    )
-                preview += (
-                    f"\n{sandbox_line}"
-                    f" (no confinement; approval is the only control)"
-                    f"\nfeatures: {', '.join(features) if features else 'none detected'}"
-                )
-            elif validated.spec.capability is Capability.FILESYSTEM_WRITE:
-                mutation_plan = _mutation_plan_for_call(validated, execution_context)
-                if isinstance(mutation_plan, ToolError):
-                    # Plan-build failures (no_match, ambiguous_match, ...)
-                    # surface as typed results, never as approval prompts.
-                    result = ToolResult(
-                        call_id=call_id,
-                        tool_name=validated.call.name,
-                        error=mutation_plan,
-                    )
-                    _emit(event_store, event_session_id, [_result_event(result)])
-                    results.append(result)
-                    continue
-                strict_note = (
-                    " [strict: patch export]" if execution_context.mutation_mode == "export" else ""
-                )
-                preview += (
-                    f"\nmutation: {mutation_plan.operation} "
-                    f"{mutation_plan.relative_path}{strict_note}\n{mutation_plan.preview}"
-                )
-            plan = build_action_plan(
-                validated,
-                registry_digest=registry.digest,
-                workspace=execution_context.guard.identity,
-                preview=preview,
-                execution_facts=facts,
-            )
-            plan_digest = plan.digest()
-            _emit(
-                event_store,
-                event_session_id,
-                [
-                    _decision_event(call_id, "require_approval", decision.reason.value),
-                    NewEvent(
-                        "approval_requested",
-                        ApprovalRequestedPayload(
-                            call_id=call_id, plan_digest=plan_digest, preview=preview
-                        ),
-                    ),
-                ],
-            )
-            if not _request_approval(plan):
-                result = ToolResult(
-                    call_id=call_id,
-                    tool_name=validated.call.name,
-                    error=ToolError(
-                        code="approval_denied",
-                        message=(
-                            "User denied or cancelled the approval; the call was not executed."
-                        ),
-                    ),
-                )
-                _emit(
-                    event_store,
-                    event_session_id,
-                    [
-                        NewEvent(
-                            "approval_denied",
-                            ApprovalDeniedPayload(call_id=call_id, plan_digest=plan_digest),
-                        ),
-                        _result_event(result),
-                    ],
-                )
-                results.append(result)
-                continue
-            token = approval_authority.issue(plan)
-            result = execute_validated_call(
-                validated,
-                execution_context,
-                approval=token,
-                authority=approval_authority,
-                plan=plan,
-            )
-            _emit(
-                event_store,
-                event_session_id,
-                [
-                    NewEvent(
-                        "approval_granted",
-                        ApprovalGrantedPayload(call_id=call_id, plan_digest=plan_digest),
-                    ),
-                    _result_event(result),
-                ],
-            )
-            results.append(result)
-    return results
+    engine = AgentEngine(
+        registry,
+        policy_engine,
+        execution_context,
+        approval_authority,
+        consent=_request_approval,
+        event_store=event_store,
+        event_session_id=event_session_id,
+        on_store_warning=lambda message: print(f"[events warning: {message}]"),
+    )
+    return engine.admit_calls(native_calls)
 
 
 def _report_prompt_switch(compiled: CompiledPrompt, previous: str | None) -> None:
@@ -752,6 +513,78 @@ def main():
         interrupted = True
 
     signal.signal(signal.SIGINT, on_sigint)
+
+    def handle_round(engine_round: EngineRound) -> None:
+        """Mirror one admitted round into the transcript and conversation."""
+        conv.add_assistant_tool_call(list(engine_round.native_calls))
+        for result in engine_round.results:
+            if result.success:
+                result_text = result.output or ""
+                print(f"  [{result.tool_name}] ok")
+            else:
+                error = cast(ToolError, result.error)  # not success implies error
+                result_text = f"[{error.code}] {error.message}"
+                print(f"  [{result.tool_name}] {error.code}")
+            conv.add_native_tool_result(result.tool_name, result_text)
+
+    # Bounded engine (WU-07): drives the native tool rounds of each user
+    # turn. All I/O seams are injected -- consent is the interactive
+    # approval prompt, cancellation reads the SIGINT flag.
+    engine = AgentEngine(
+        runtime_registry,
+        policy_engine,
+        execution_context,
+        approval_authority,
+        consent=_request_approval,
+        event_store=event_store,
+        event_session_id=event_session_id,
+        cancel_requested=lambda: interrupted,
+        on_round=handle_round,
+        on_store_warning=lambda message: print(f"[events warning: {message}]"),
+    )
+
+    def stream_round() -> ProviderRound:
+        """One provider round: stream + display, return text and calls.
+
+        Defined once; it reads the per-turn locals (system_prompt, turns,
+        interrupted) live at call time.
+        """
+        if _RICH and stream_ctrl:
+            try:
+                resp, eval_tokens = stream_ctrl.stream_response(
+                    conv.get_messages(), system_prompt, tools=tool_schemas
+                )
+            except StreamCancelled:
+                raise StreamCancelledError from None
+            except Exception as error:
+                raise StreamError("provider_error", str(error)) from error
+        else:
+            display.reset()
+            cancelled = False
+            try:
+                for chunk in client.chat_stream(
+                    conv.get_messages(), system_prompt, tools=tool_schemas
+                ):
+                    if interrupted:
+                        cancelled = True
+                        break
+                    display.feed(chunk)
+            except KeyboardInterrupt:
+                cancelled = True
+            except Exception as error:
+                raise StreamError("provider_error", str(error)) from error
+            display.flush()
+            print()
+            if cancelled:
+                raise StreamCancelledError
+            resp = display.get_full_response()
+        conv.update_tokens(client.last_prompt_tokens)
+        state.tokens_used = conv.total_prompt_tokens
+        state.turn = turns
+        return ProviderRound(
+            text=resp or "",
+            native_calls=tuple(getattr(client, "last_tool_calls", [])),
+        )
 
     while True:
         # Get input
@@ -1041,85 +874,36 @@ def main():
         if db:
             db.add_message(session_id, "user", user_input)
 
-        # === Tool execution loop (native tool calling) ===
+        # === Tool execution loop (bounded engine drives native rounds) ===
         turns = 0
         errors = 0
-        native_rounds = 0
 
         while turns < MAX_TOOL_TURNS:
             interrupted = False
+            outcome = engine.run_turn(stream_round)
+            turns += outcome.steps
 
-            # Stream response
-            if _RICH and stream_ctrl:
-                try:
-                    resp, eval_tokens = stream_ctrl.stream_response(
-                        conv.get_messages(), system_prompt, tools=tool_schemas
+            if outcome.status is EngineState.CANCELLED:
+                print("[Interrupted]")
+                break
+            if outcome.status is EngineState.FAILED:
+                if _RICH:
+                    console.print(ui.render_error(outcome.detail))
+                else:
+                    print(f"\n[Error: {outcome.detail}]")
+                break
+            if outcome.status is EngineState.BUDGET_EXHAUSTED:
+                if outcome.reason == "budget_steps":
+                    print(
+                        f"[Budget exhausted (budget_steps): "
+                        f"native tool limit ({MAX_NATIVE_TOOL_TURNS}) reached]"
                     )
-                except StreamCancelled:
-                    print("[Interrupted]")
-                    break
-                except Exception as e:
-                    if _RICH:
-                        console.print(ui.render_error(str(e)))
-                    else:
-                        print(f"[Error: {e}]")
-                    break
-            else:
-                display.reset()
-                try:
-                    for chunk in client.chat_stream(
-                        conv.get_messages(), system_prompt, tools=tool_schemas
-                    ):
-                        if interrupted:
-                            break
-                        display.feed(chunk)
-                except KeyboardInterrupt:
-                    interrupted = True
-                except Exception as e:
-                    print(f"\n[Error: {e}]")
-                    break
-                display.flush()
-                print()
-                resp = display.get_full_response()
-
-                if interrupted:
-                    print("[Interrupted]")
-                    break
-
-            conv.update_tokens(client.last_prompt_tokens)
-            state.tokens_used = conv.total_prompt_tokens
-            state.turn = turns
-
-            # Native tool calls: admission pipeline (validate -> policy -> execute)
-            native_calls = list(getattr(client, "last_tool_calls", []))
-            if native_calls:
-                conv.add_assistant_tool_call(native_calls)
-                _emit(event_store, event_session_id, _proposal_events(native_calls))
-                results = _admit_native_calls(
-                    native_calls,
-                    runtime_registry,
-                    policy_engine,
-                    execution_context,
-                    approval_authority,
-                    event_store=event_store,
-                    event_session_id=event_session_id,
-                )
-                for result in results:
-                    if result.success:
-                        text = result.output or ""
-                        print(f"  [{result.tool_name}] ok")
-                    else:
-                        text = f"[{result.error.code}] {result.error.message}"
-                        print(f"  [{result.tool_name}] {result.error.code}")
-                    conv.add_native_tool_result(result.tool_name, text)
-                turns += 1
-                native_rounds += 1
-                if native_rounds >= MAX_NATIVE_TOOL_TURNS:
-                    print(f"[Native tool limit ({MAX_NATIVE_TOOL_TURNS}) reached]")
-                    break
-                continue
+                else:
+                    print(f"[Budget exhausted ({outcome.reason})]")
+                break
 
             # No native tool calls -- check for text response
+            resp = outcome.text or ""
             if resp and resp.strip():
                 conv.add_assistant(resp)
                 _emit(
