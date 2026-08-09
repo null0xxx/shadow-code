@@ -22,6 +22,11 @@ BASH_STRICT = _env_flag("SHADOW_BASH_STRICT")
 # Strict mode: withhold the filesystem-write capability entirely, so the
 # policy engine denies write_file/edit_file with CAPABILITY_NOT_GRANTED.
 MUTATION_STRICT = _env_flag("SHADOW_MUTATION_STRICT")
+# Opt-in persistent terminal shell (WU-09); the line-oriented REPL stays the
+# default and doubles as the minimal diagnostic client.
+TUI_ENABLED = _env_flag("SHADOW_TUI")
+# Plain ASCII decoration for the TUI (NO_COLOR is honored separately).
+ASCII_MODE = _env_flag("SHADOW_ASCII")
 MAX_LINES_TO_READ = 2000
 INTERACTIVE_CMDS = {"vim", "vi", "nano", "less", "more", "top", "htop", "man"}
 BLOCKED_PATHS = {

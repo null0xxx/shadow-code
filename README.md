@@ -271,6 +271,53 @@ compaction — no event is ever updated or deleted.
 The legacy 3-tier message-level compaction remains as the automatic safety net
 and as the fallback when the event store is unavailable.
 
+### Persistent TUI (opt-in, WU-09)
+
+Set `SHADOW_TUI=1` to run a persistent terminal shell instead of the
+line-oriented REPL. The TUI only activates when stdin/stdout are real TTYs and
+prompt_toolkit is installed; anything missing falls back to the line REPL,
+which doubles as the minimal diagnostic client (the roadmap rollback boundary:
+removing the TUI changes neither execution nor stored history).
+
+```
+SHADOW_TUI=1 shadow-code
+```
+
+Layout: a read-only **transcript** (your messages, assistant text streamed
+live as it arrives, tool lifecycle lines like `[read_file] ok`, budget and
+slash-command output), a **multiline input** area, and a **footer** showing
+model, token usage, context %, workspace root, active prompt snapshot digest,
+and permission labels (e.g. `bash:UNCONFINED`, `mutation:export`).
+
+Keybindings:
+
+```
+Enter          Send (y/n while an approval is pending)
+Alt+Enter      Insert a newline (Esc then Enter)
+Ctrl+C         Cancel the active turn (denies a pending approval)
+Ctrl+D         Exit (denies a pending approval, cancels active work first)
+Ctrl+U         Clear the input
+Ctrl+L         Repaint
+Up/Down        History (shared with the line REPL)
+```
+
+Approvals keep the fail-closed contract: the action plan is rendered into the
+transcript and only an explicit `y` in the input area approves; Ctrl+C,
+Ctrl+D, empty input, or anything else denies. Cancelling mid-turn sets the
+engine's cancel flag — the turn ends as CANCELLED and prompt_toolkit restores
+the terminal, never leaving it corrupted.
+
+The footer condenses across width buckets (≥120, ≥80, ≥40, <40 columns);
+input content and focus survive resizes. Model and tool output is sanitized
+before rendering, so no ANSI/control sequence can escape into your terminal.
+`NO_COLOR` disables all styling and forces plain-ASCII decoration (which
+`SHADOW_ASCII=1` also enables on its own); every semantic label stays visible
+as text.
+
+In TUI mode Rich performs no direct terminal writes — prompt_toolkit owns the
+screen. The engine, event store, policy, and provider layers are untouched;
+the TUI drives the exact same session machinery through injected seams.
+
 ## Features
 
 | Feature | Description |
@@ -340,6 +387,8 @@ and text responses, but commands that require file or shell tools cannot execute
 | `SHADOW_LEGACY_MARKDOWN_TOOLS` | disabled | Opt in to the unsafe compatibility tool path |
 | `SHADOW_BASH_STRICT` | disabled | Deny shell execution when no kernel sandbox is available |
 | `SHADOW_MUTATION_STRICT` | disabled | Export approved file changes as reviewed patches under `.shadow-code-exports/`, never apply them |
+| `SHADOW_TUI` | disabled | Opt in to the persistent TUI (real TTYs + prompt_toolkit required) |
+| `SHADOW_ASCII` | disabled | Plain-ASCII TUI decoration (`NO_COLOR` forces this too) |
 
 ## Architecture
 
