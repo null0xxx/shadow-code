@@ -234,6 +234,43 @@ Legacy sessions from `~/.shadow-code/sessions.db` are never migrated. To audit o
 through the event store, call `EventStore.import_legacy_session(path, session_id)` —
 it copies the messages read-only into a `legacy-<id>` event session and is idempotent.
 
+### Context compaction (WU-08)
+
+Long sessions shrink model context without losing causal tool groups or source
+history. The event log is the source of truth and is **never modified** by
+compaction — no event is ever updated or deleted.
+
+- **Causal groups.** The event stream is grouped into indivisible units: a tool
+  call's proposal → policy decision → approval → result chain is one group, a
+  plain message is a singleton. A proposed call without a terminal result is
+  pending and can never be selected.
+- **Closed-range selection.** `/compact` selects the oldest complete groups that
+  fit the context budget. A selection never splits a group, never takes a
+  pending one, and stops at the first pending group; a multi-call batch whose
+  proposals landed together is all-or-nothing.
+- **Snapshots.** The selected range is summarized by the model into a typed
+  `context_snapshot` event. The snapshot records the covered sequence range,
+  group count, a digest of the covered event ids, and a source digest that also
+  binds the projection-logic version — changed projection logic or tampering is
+  detected on validation. Validation also flags hallucinated file references:
+  paths that appear neither in the covered payloads nor beneath the workspace.
+  A failed summary or failed validation creates **no** snapshot and leaves the
+  conversation untouched.
+- **Projection.** After compacting, the provider sees one synthetic assistant
+  message with the summary plus the projection of everything after the covered
+  range, so tool results are never orphaned. The original events remain
+  queryable at any time (`/events`, `events_for`).
+- **Emergency reduction** (`emergency_reduce`) is projection-level only: beyond
+  the snapshot it drops the oldest complete terminal groups in favor of a
+  placeholder marker and never touches pending groups; the event log stays
+  intact.
+- **Diagnostics.** `/context` prints group counts by kind, terminal/pending
+  counts, uncovered token estimate, active snapshot coverage and digests, and
+  integrity issues.
+
+The legacy 3-tier message-level compaction remains as the automatic safety net
+and as the fallback when the event store is unavailable.
+
 ## Features
 
 | Feature | Description |
@@ -254,7 +291,8 @@ it copies the messages read-only into a `legacy-<id>` event session and is idemp
 /tokens        Show context usage
 /info          Session info
 /cd [path]     Change working directory
-/compact       Manually compact conversation
+/compact       Compact complete context groups into an event-sourced snapshot
+/context       Show context diagnostics (groups, tokens, snapshot coverage)
 /history       Show recent messages
 /save [name]   Save session
 /load [id]     Load session
@@ -314,6 +352,7 @@ shadow-code/
     provider.py        Provider-neutral typed streaming contract
     ollama_client.py   Ollama API streaming client (thin adapter over provider.py)
     conversation.py    Message history, 3-tier context management
+    context_compaction.py  Event-sourced causal groups, snapshots, projection
     display.py         Streaming buffer (hides tool JSON from user)
     compaction.py      LLM-based conversation summarization
     skills.py          Skill system (/commit, /review, etc.)

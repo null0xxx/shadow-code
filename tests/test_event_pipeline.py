@@ -284,5 +284,114 @@ class TestEventsCommandAndDegradation(EventPipelineCase):
         self.assertFalse(self.events_db.exists())
 
 
+class TestContextCompaction(EventPipelineCase):
+    """WU-08: main()-driven /compact and /context over the event store."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.workspace / "note.txt").write_text("hello wu08", encoding="utf-8")
+
+    @staticmethod
+    def _read_call() -> dict:
+        return {
+            "call_id": "call-0",
+            "name": "read_file",
+            "arguments": {"file_path": "note.txt"},
+        }
+
+    def test_compact_snapshots_groups_shrinks_conversation_keeps_events(self) -> None:
+        self.responses = [
+            ([], [self._read_call()]),
+            (["done"], []),
+            (["## User Goal\nRead note.txt for the user."], []),  # /compact summary
+        ]
+        self.inputs = ["read note.txt", "/compact", "/context", "/exit"]
+
+        output = self._run_main()
+
+        self.assertIn("[Compacted:", output)
+        self.assertIn("original events retained", output)
+        # The live conversation is now the projection: one summary message.
+        messages = self.conversation.get_messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Compaction summary", messages[0]["content"])
+        self.assertIn("Read note.txt", messages[0]["content"])
+
+        # /context printed the diagnostics block.
+        self.assertIn("groups:", output)
+        self.assertIn("snapshot: seq", output)
+        self.assertIn("pending: 0", output)
+
+        with EventStore(self.events_db) as store:
+            session = store.latest_session_id()
+            assert session is not None
+            types = [event.type for event in store.events_for(session)]
+            # One snapshot event appended; the original chain is untouched.
+            self.assertEqual(types.count("context_snapshot"), 1)
+            for expected in ("tool_call_proposed", "policy_decision", "tool_result"):
+                self.assertIn(expected, types)
+            self.assertEqual(store.verify(session), [])
+            self.assertEqual(store.pending_tool_calls(session), [])
+            # Resume parity: a reopened store rebuilds the live projection.
+            from shadow_code.context_compaction import (
+                active_snapshot,
+                build_provider_messages,
+            )
+
+            self.assertEqual(build_provider_messages(store, session), messages)
+            self.assertIsNotNone(active_snapshot(store, session))
+
+    def test_failed_summary_creates_no_snapshot_and_keeps_conversation(self) -> None:
+        self.responses = [
+            ([], [self._read_call()]),
+            (["done"], []),
+            ([""], []),  # empty summarizer response -> compact() raises
+        ]
+        self.inputs = ["read note.txt", "/compact", "/exit"]
+
+        output = self._run_main()
+
+        self.assertIn("[Compaction failed", output)
+        # Conversation untouched: user, assistant tool_calls, tool, assistant.
+        self.assertEqual(len(self.conversation.get_messages()), 4)
+        with EventStore(self.events_db) as store:
+            session = store.latest_session_id()
+            assert session is not None
+            types = [event.type for event in store.events_for(session)]
+            self.assertNotIn("context_snapshot", types)
+
+    def test_hallucinated_summary_is_rejected_without_snapshot(self) -> None:
+        self.responses = [
+            ([], [self._read_call()]),
+            (["done"], []),
+            (["## Files Modified\n- src/ghost_wu08.py: rewrote it"], []),
+        ]
+        self.inputs = ["read note.txt", "/compact", "/exit"]
+
+        output = self._run_main()
+
+        self.assertIn("[Compaction failed (snapshot_invalid)", output)
+        self.assertIn("ghost_wu08.py", output)
+        self.assertEqual(len(self.conversation.get_messages()), 4)
+        with EventStore(self.events_db) as store:
+            session = store.latest_session_id()
+            assert session is not None
+            types = [event.type for event in store.events_for(session)]
+            self.assertNotIn("context_snapshot", types)
+
+    def test_compact_with_nothing_eligible_is_a_noop(self) -> None:
+        self.responses = [
+            ([], [self._read_call()]),
+            (["done"], []),
+            (["## User Goal\nRead note.txt."], []),
+        ]
+        self.inputs = ["read note.txt", "/compact", "/compact", "/exit"]
+
+        output = self._run_main()
+
+        self.assertEqual(output.count("[Compacted:"), 1)
+        self.assertIn("no complete groups beyond the active snapshot", output)
+
+
 if __name__ == "__main__":
     unittest.main()
