@@ -250,6 +250,79 @@ class TestNativeToolAdmission(unittest.TestCase):
             self.assertIn("## bash", prompts[0])
             self.assertNotIn("native_tools_unavailable", stdout.getvalue())
 
+    def test_native_step_budget_prints_typed_exhaustion_message(self):
+        import importlib
+        import tempfile
+
+        from shadow_code.conversation import Conversation
+        from shadow_code.policy.workspace import WorkspaceGuard
+
+        main_module = importlib.import_module("shadow_code.main")
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as state_home,
+            tempfile.TemporaryDirectory() as config_home,
+        ):
+            for index in range(4):
+                path = os.path.join(workspace, f"hello{index}.txt")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(f"budget content {index}\n")
+
+            client = MagicMock()
+            client.health_check.return_value = (True, "OK")
+            client.last_prompt_tokens = 0
+            client.last_eval_tokens = 0
+            stream_calls = []
+
+            def chat_stream(messages, system, model=None, tools=None):
+                # Distinct file per round: the duplicate guard must not
+                # trip; only the step budget stops this turn.
+                index = len(stream_calls)
+                stream_calls.append(1)
+                client.last_tool_calls = [
+                    {
+                        "call_id": f"call-{index}",
+                        "name": "read_file",
+                        "arguments": {"file_path": f"hello{index}.txt"},
+                    }
+                ]
+                return iter([])
+
+            client.chat_stream.side_effect = chat_stream
+            conversation = Conversation()
+
+            with (
+                patch.object(main_module, "_RICH", False),
+                patch.object(main_module, "_HAS_REPL", False),
+                patch.object(main_module, "_HAS_DB", False),
+                patch.object(main_module, "OllamaClient", return_value=client),
+                patch.object(main_module, "Conversation", return_value=conversation),
+                patch.object(
+                    main_module,
+                    "WorkspaceGuard",
+                    side_effect=lambda root, **kw: WorkspaceGuard(workspace),
+                ),
+                patch.object(main_module, "_register_optional_tools"),
+                patch.object(main_module.tool_reg, "register"),
+                patch.object(main_module.signal, "signal"),
+                patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": config_home},
+                ),
+                patch("builtins.input", side_effect=["loop forever", "/exit"]),
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                main_module.main()
+
+            # The engine's step budget (MAX_NATIVE_TOOL_TURNS=4) stops the
+            # turn with a typed reason after four executed rounds.
+            self.assertEqual(len(stream_calls), 4)
+            output = stdout.getvalue()
+            self.assertIn("Budget exhausted (budget_steps)", output)
+            self.assertIn("native tool limit (4) reached", output)
+            tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 4)
+
     def test_strict_mode_denies_unconfined_bash_but_allows_read_file(self):
         import importlib
         import tempfile
