@@ -28,6 +28,13 @@ class DatabaseError(Exception):
     pass
 
 
+def default_db_path() -> str:
+    """Default session database path: ~/.shadow-code/sessions.db."""
+    db_dir = Path("~/.shadow-code").expanduser()
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return str(db_dir / "sessions.db")
+
+
 class Database:
     """SQLite database for persisting conversation sessions."""
 
@@ -39,9 +46,7 @@ class Database:
                      ~/.shadow-code/sessions.db
         """
         if db_path is None:
-            db_dir = Path("~/.shadow-code").expanduser()
-            db_dir.mkdir(parents=True, exist_ok=True)
-            db_path = str(db_dir / "sessions.db")
+            db_path = default_db_path()
 
         self._path = db_path
         try:

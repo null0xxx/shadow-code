@@ -136,6 +136,25 @@ class EngineRound:
 
 
 @dataclass(frozen=True, slots=True)
+class CallEvent:
+    """Additive per-call lifecycle notification for UI frontends (WU-10).
+
+    The engine's decisions are unchanged by this seam; it only reports
+    stages as they happen: ``round`` (a new admission batch starts),
+    ``proposed`` (a raw call entered the batch), ``awaiting_approval``,
+    ``executing``, and ``result`` (one terminal ToolResult, attached).
+    Frontends that do not need it simply never pass the callback.
+    """
+
+    stage: str
+    call_id: str = ""
+    tool_name: str = ""
+    arguments_json: str = ""
+    step: int = 0
+    result: ToolResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EngineResult:
     """Terminal outcome of one bounded turn."""
 
@@ -157,23 +176,29 @@ def _canonical_json(value: object) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def _call_identity(raw_call: object) -> tuple[str, str, str]:
+    """(call_id, name, canonical arguments JSON) for a raw proposed call."""
+    if isinstance(raw_call, dict):
+        return (
+            str(raw_call.get("call_id") or "invalid-call"),
+            str(raw_call.get("name") or "unknown"),
+            _canonical_json(raw_call.get("arguments")),
+        )
+    return "invalid-call", "unknown", _canonical_json(None)
+
+
 def _proposal_events(native_calls: Sequence[Mapping[str, Any]]) -> list[NewEvent]:
     """One tool_call_proposed event per raw call, in proposal order."""
     events = []
     for raw_call in native_calls:
-        if isinstance(raw_call, dict):
-            call_id = str(raw_call.get("call_id") or "invalid-call")
-            name = str(raw_call.get("name") or "unknown")
-            arguments = raw_call.get("arguments")
-        else:
-            call_id, name, arguments = "invalid-call", "unknown", None
+        call_id, name, arguments_json = _call_identity(raw_call)
         events.append(
             NewEvent(
                 "tool_call_proposed",
                 ToolCallProposedPayload(
                     call_id=call_id,
                     name=name,
-                    arguments_json=_canonical_json(arguments),
+                    arguments_json=arguments_json,
                 ),
             )
         )
@@ -281,6 +306,7 @@ class AgentEngine:
         cancel_requested: Callable[[], bool] | None = None,
         on_round: Callable[[EngineRound], None] | None = None,
         on_event: Callable[[EngineState], None] | None = None,
+        on_call_event: Callable[[CallEvent], None] | None = None,
         on_store_warning: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -295,6 +321,7 @@ class AgentEngine:
         self._cancel_requested = cancel_requested
         self._on_round = on_round
         self._on_event = on_event
+        self._on_call_event = on_call_event
         self._on_store_warning = on_store_warning
         self._clock = clock
         self._state = EngineState.IDLE
@@ -342,6 +369,11 @@ class AgentEngine:
     def _raise_if_cancelled(self) -> None:
         if self._cancel_requested is not None and self._cancel_requested():
             raise _TurnCancelled
+
+    def _notify_call(self, event: CallEvent) -> None:
+        """Additive UI seam (WU-10), unguarded like on_round/on_event."""
+        if self._on_call_event is not None:
+            self._on_call_event(event)
 
     # -- public entry points --------------------------------------------
 
@@ -399,6 +431,19 @@ class AgentEngine:
             if not native_calls:
                 return self._finish(EngineState.COMPLETED, "completed", text=provider_round.text)
             self._emit(_proposal_events(native_calls))
+            step = self._steps + 1
+            self._notify_call(CallEvent(stage="round", step=step))
+            for raw_call in native_calls:
+                call_id, name, arguments_json = _call_identity(raw_call)
+                self._notify_call(
+                    CallEvent(
+                        stage="proposed",
+                        call_id=call_id,
+                        tool_name=name,
+                        arguments_json=arguments_json,
+                        step=step,
+                    )
+                )
             terminal = self._admit_round(native_calls)
             if terminal is not None:
                 return terminal
@@ -459,6 +504,9 @@ class AgentEngine:
             self._emit([_decision_event(call_id, "allow", decision.reason.value)])
             self._raise_if_cancelled()
             self._transition(EngineState.EXECUTING)
+            self._notify_call(
+                CallEvent(stage="executing", call_id=call_id, tool_name=validated.call.name)
+            )
             result = execute_validated_call(validated, self._execution_context)
             self._transition(EngineState.ADMITTING)
             self._emit([_result_event(result)])
@@ -538,6 +586,9 @@ class AgentEngine:
             ]
         )
         self._transition(EngineState.AWAITING_APPROVAL)
+        self._notify_call(
+            CallEvent(stage="awaiting_approval", call_id=call_id, tool_name=validated.call.name)
+        )
         self._raise_if_cancelled()
         if not self._consent(plan):
             result = ToolResult(
@@ -562,6 +613,9 @@ class AgentEngine:
         self._raise_if_cancelled()
         token = self._approval_authority.issue(plan)
         self._transition(EngineState.EXECUTING)
+        self._notify_call(
+            CallEvent(stage="executing", call_id=call_id, tool_name=validated.call.name)
+        )
         result = execute_validated_call(
             validated,
             context,
@@ -612,6 +666,14 @@ class AgentEngine:
     def _record_result(self, result: ToolResult) -> None:
         self._pending_results.append(result)
         self._results.append(result)
+        self._notify_call(
+            CallEvent(
+                stage="result",
+                call_id=result.call_id,
+                tool_name=result.tool_name,
+                result=result,
+            )
+        )
 
     def _skip_remaining(self, remaining: list[Mapping[str, Any]], reason: str) -> None:
         """Give every unadmitted proposal a terminal budget_exhausted result."""

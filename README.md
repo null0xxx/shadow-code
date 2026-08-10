@@ -284,26 +284,73 @@ SHADOW_TUI=1 shadow-code
 ```
 
 Layout: a read-only **transcript** (your messages, assistant text streamed
-live as it arrives, tool lifecycle lines like `[read_file] ok`, budget and
-slash-command output), a **multiline input** area, and a **footer** showing
+live as it arrives, tool lifecycle groups, budget and slash-command output),
+a bounded **approval panel** that appears only while a decision is pending,
+a **multiline input** area, and a **footer** showing
 model, token usage, context %, workspace root, active prompt snapshot digest,
 and permission labels (e.g. `bash:UNCONFINED`, `mutation:export`).
 
 Keybindings:
 
 ```
-Enter          Send (y/n while an approval is pending)
+Enter          Send (a no-op while an approval is pending)
 Alt+Enter      Insert a newline (Esc then Enter)
+y / n          Approve / deny while the approval panel is focused
+Esc            Deny a pending approval (same as n)
+Ctrl+E         Expand/collapse the latest truncated tool output
 Ctrl+C         Cancel the active turn (denies a pending approval)
 Ctrl+D         Exit (denies a pending approval, cancels active work first)
 Ctrl+U         Clear the input
 Ctrl+L         Repaint
-Up/Down        History (shared with the line REPL)
+Up/Down        History (scroll the approval panel while it is pending)
 ```
 
-Approvals keep the fail-closed contract: the action plan is rendered into the
-transcript and only an explicit `y` in the input area approves; Ctrl+C,
-Ctrl+D, empty input, or anything else denies. Cancelling mid-turn sets the
+### Tool lifecycle and approvals (WU-10)
+
+Tool calls render **grouped per engine round** under a `step n` header, each
+row carrying a status token that updates in place as the call moves through
+`proposed → awaiting approval → executing → ok | denied | failed | exported`:
+
+```
+step 1
+  ok read_file  target.txt  [ok]
+  ok write_file  target.txt  [ok]
+    mutation: write target.txt
+    status: executed
+  x bash  $ touch bash-ran.txt  [denied — not retried]
+    hint: denied by user — not retried
+```
+
+Unicode glyphs (`✓ ○ ✗ …`) are decorative; the text label is the evidence and
+survives every theme. ASCII/NO_COLOR mode uses `ok/o/x/...` markers instead.
+Approved mutations in strict mode are labeled `[exported]` (patch written to
+`.shadow-code-exports/`, workspace untouched) versus `status: executed` in the
+result body of an applied mutation. Failed and denied rows get a one-line
+`hint:` mapped from the typed error code (`no_match` → "re-read the file; the
+exact text changed", `workspace_drift` → "file changed on disk; re-read and
+retry", …).
+
+Results longer than 12 lines collapse to head + tail with a
+`… M more lines (Ctrl+E: expand)` marker; `Ctrl+E` toggles the full content in
+place — the transcript scrolls, the input area never moves. Long single lines
+(huge paths, huge commands) wrap instead of being truncated.
+
+Approvals keep the fail-closed contract, now through a **single-focus panel**
+rendered above the input area when the engine enters AWAITING_APPROVAL. The
+panel shows every approval-bound action-plan fact before you decide: tool and
+version, capability, full canonical arguments, workspace identity, registry
+digest, plan digest, execution facts, and the exact preview (a unified diff
+for mutations; command + sandbox + feature classification for bash). The
+panel is bounded (max 14 rows) and scrolls with Up/Down; the input area is
+unreachable while it is focused. Only `y` approves; `n`, Esc, Ctrl+C, and
+Ctrl+D all deny. Each side-effecting call in a batch gets its OWN fresh
+control — there is no "approve all" and consent never carries over between
+calls. A denial is final and stays visible as a `denied — not retried` row;
+a stale plan (authority-fact change before execution) surfaces as
+`plan changed — approval rejected`; a file changed on disk between preview
+and execution surfaces as the `workspace_drift` failure with its hint.
+
+Cancelling mid-turn sets the
 engine's cancel flag — the turn ends as CANCELLED and prompt_toolkit restores
 the terminal, never leaving it corrupted.
 

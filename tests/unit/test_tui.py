@@ -344,70 +344,271 @@ class TestTuiAppKeys(TuiAppCase):
         self.assertTrue(app._inputs.empty())
 
 
-class TestApprovalBridge(TuiAppCase):
-    def _answer_in_thread(self, app: TuiApp, keys: str) -> bool:
+class TestApprovalWidget(TuiAppCase):
+    """WU-10 single-focus approval control; the WU-09 bridge evolved here."""
+
+    def _plan(self, call_id: str = "c1", **overrides):
+        from shadow_code.domain.approval import ActionPlan
+
+        base = {
+            "call_id": call_id,
+            "tool_name": "bash",
+            "tool_version": "1.0.0",
+            "capability": "process.execute",
+            "canonical_arguments_json": '{"command":"echo hi"}',
+            "workspace_device": 1,
+            "workspace_inode": 2,
+            "registry_digest": "cd" * 32,
+            "preview": "bash v1.0.0 [process.execute]\nsandbox: unconfined\nfeatures: none",
+            "execution_facts": "uid=1000",
+        }
+        base.update(overrides)
+        return ActionPlan(**base)
+
+    def _run_consent(self, app: TuiApp, plan, answer: bool | None) -> bool:
+        """Run _consent on a worker; resolve (or Ctrl+C) from the test thread."""
         result: list[bool] = []
-
-        def ask() -> None:
-            result.append(app._ask_approval("Action requires approval:\n  tool: bash"))
-
-        worker = threading.Thread(target=ask)
+        worker = threading.Thread(target=lambda: result.append(app._consent(plan)))
         worker.start()
-        # No event loop is running, so post() applies inline: the bridge
-        # sets _approval_pending synchronously before it blocks.
+        # No event loop is running, so post() applies inline: the widget
+        # arms synchronously before the bridge blocks.
         for _ in range(1000):
             if app._approval_pending:
                 break
             time.sleep(0.001)
         self.assertTrue(app._approval_pending)
-        app.input_area.text = keys
-        app._on_enter()
+        # Single focus: the panel owns the keys, the input area does not.
+        self.assertIs(app.app.layout.current_control, app._approval_control)
+        self.assertEqual(app._footer_model().state, "approval")
+        if answer is None:
+            app._on_cancel()  # Ctrl+C == deny
+        else:
+            app._resolve_approval(answer)
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
         return result[0]
 
-    def test_y_approves(self):
+    def test_y_approves_and_restores_focus(self):
         app = self._app()
-        self.assertTrue(self._answer_in_thread(app, "y"))
-        self.assertIn("[Approved]", app.model.render(_ASCII))
+        self.assertTrue(self._run_consent(app, self._plan(), True))
+        self.assertFalse(app._approval_pending)
+        self.assertIs(app.app.layout.current_control, app.input_area.control)
+        self.assertEqual(app._footer_model().state, "idle")
 
     def test_n_denies(self):
         app = self._app()
-        self.assertFalse(self._answer_in_thread(app, "n"))
-        self.assertIn("[Denied]", app.model.render(_ASCII))
+        self.assertFalse(self._run_consent(app, self._plan(), False))
 
-    def test_garbage_denies(self):
+    def test_ctrl_c_denies(self):
         app = self._app()
-        self.assertFalse(self._answer_in_thread(app, "sure why not"))
+        self.assertFalse(self._run_consent(app, self._plan(), None))
 
-    def test_empty_denies(self):
-        app = self._app()
-        self.assertFalse(self._answer_in_thread(app, ""))
-
-    def test_ctrl_c_denies_pending_approval(self):
+    def test_ctrl_d_denies_pending_approval(self):
         app = self._app()
         result: list[bool] = []
-
-        def ask() -> None:
-            result.append(app._ask_approval("prompt"))
-
-        worker = threading.Thread(target=ask)
+        worker = threading.Thread(target=lambda: result.append(app._consent(self._plan())))
         worker.start()
         for _ in range(1000):
             if app._approval_pending:
                 break
             time.sleep(0.001)
-        app._on_cancel()
+        app._on_exit()
         worker.join(timeout=5)
-        self.assertFalse(worker.is_alive())
         self.assertEqual(result, [False])
 
-    def test_approval_prompt_appears_in_transcript(self):
+    def test_enter_is_noop_while_pending(self):
         app = self._app()
-        self._answer_in_thread(app, "n")
-        rendered = app.model.render(_ASCII)
-        self.assertIn("Action requires approval:", rendered)
-        self.assertIn("Approve this exact action? [y/N]", rendered)
+        result: list[bool] = []
+        worker = threading.Thread(target=lambda: result.append(app._consent(self._plan())))
+        worker.start()
+        for _ in range(1000):
+            if app._approval_pending:
+                break
+            time.sleep(0.001)
+        app.input_area.text = "y"  # typed text must NOT leak past the panel
+        app._on_enter()
+        self.assertTrue(app._inputs.empty())
+        self.assertTrue(app._approval_pending)
+        app._resolve_approval(False)
+        worker.join(timeout=5)
+        self.assertEqual(result, [False])
+
+    def test_panel_shows_every_plan_fact(self):
+        app = self._app()
+        plan = self._plan()
+        result: list[bool] = []
+        worker = threading.Thread(target=lambda: result.append(app._consent(plan)))
+        worker.start()
+        for _ in range(1000):
+            if app._approval_pending:
+                break
+            time.sleep(0.001)
+        content = app._approval_content()
+        text = "".join(t for _s, t in content) if isinstance(content, list) else content
+        for fact in (
+            "bash v1.0.0",
+            "process.execute",
+            '{"command":"echo hi"}',
+            "device=1",
+            "inode=2",
+            f"sha256:{'cd' * 8}",
+            f"sha256:{plan.digest()[:16]}",
+            "uid=1000",
+            "sandbox: unconfined",
+            "y approve",
+            "n deny",
+        ):
+            self.assertIn(fact, text, fact)
+        app._resolve_approval(False)
+        worker.join(timeout=5)
+
+    def test_sequential_approvals_are_fresh_controls(self):
+        """Batch of two side-effecting calls: two consents, no inheritance."""
+        app = self._app()
+        first = self._run_consent(app, self._plan("c1"), True)
+        second = self._run_consent(app, self._plan("c2"), False)
+        self.assertTrue(first)
+        self.assertFalse(second)  # the first answer was not reused
+        self.assertEqual(app._approval_count, 2)
+
+    def test_consent_records_preview_on_the_row(self):
+        app = self._app()
+        plan = self._plan()
+        app.model.tool_round(1)
+        app.model.tool_proposed("c1", "bash", '{"command":"echo hi"}')
+        self.assertFalse(self._run_consent(app, plan, False))
+        row = app.model.tools.groups[0].rows[0]
+        self.assertIn("sandbox: unconfined", row.preview_text)
+
+    def test_freeform_confirm_uses_same_control(self):
+        app = self._app()
+        result: list[bool] = []
+        worker = threading.Thread(
+            target=lambda: result.append(app._ask_approval("  Proceed? (y/n): "))
+        )
+        worker.start()
+        for _ in range(1000):
+            if app._approval_pending:
+                break
+            time.sleep(0.001)
+        self.assertIn("Proceed?", app._approval_content())
+        app._resolve_approval(True)
+        worker.join(timeout=5)
+        self.assertEqual(result, [True])
+
+    def test_panel_scroll_keys_clamped(self):
+        app = self._app()
+        keys = {binding.keys for binding in app.app.key_bindings.bindings}
+        self.assertIn(("up",), keys)
+        self.assertIn(("down",), keys)
+        self.assertIn(("y",), keys)
+        self.assertIn(("n",), keys)
+
+
+class TestTranscriptLifecycle(TuiAppCase):
+    """Engine CallEvent stream -> grouped, in-place transcript rows."""
+
+    def _event(self, stage, call_id="", tool_name="", arguments_json="", step=0, result=None):
+        from shadow_code.engine import CallEvent
+
+        return CallEvent(
+            stage=stage,
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments_json=arguments_json,
+            step=step,
+            result=result,
+        )
+
+    def test_full_round_lifecycle_renders_grouped_rows(self):
+        from shadow_code.domain.tools import ToolError, ToolResult
+
+        app = self._app()
+        app._on_call_event(self._event("round", step=1))
+        app._on_call_event(self._event("proposed", "c1", "read_file", '{"path":"a.py"}', 1))
+        app._on_call_event(self._event("proposed", "c2", "bash", '{"command":"ls"}', 1))
+        app._on_call_event(self._event("executing", "c1"))
+        app._on_call_event(
+            self._event(
+                "result",
+                "c1",
+                "read_file",
+                result=ToolResult(call_id="c1", tool_name="read_file", output="contents"),
+            )
+        )
+        app._on_call_event(self._event("awaiting_approval", "c2"))
+        app._on_call_event(
+            self._event(
+                "result",
+                "c2",
+                "bash",
+                result=ToolResult(
+                    call_id="c2",
+                    tool_name="bash",
+                    error=ToolError(code="approval_denied", message="denied"),
+                ),
+            )
+        )
+        rendered = app.model.render(_ASCII, 80)
+        self.assertIn("step 1", rendered)
+        self.assertIn("read_file", rendered)
+        self.assertIn("a.py", rendered)
+        self.assertIn("ok", rendered)
+        self.assertIn("$ ls", rendered)
+        self.assertIn("denied — not retried", rendered)
+        self.assertIn("hint:", rendered)
+
+    def test_expand_toggle_via_model(self):
+        from shadow_code.domain.tools import ToolResult
+
+        app = self._app()
+        app._on_call_event(self._event("round", step=1))
+        app._on_call_event(self._event("proposed", "c1", "bash", '{"command":"ls"}', 1))
+        output = "\n".join(f"out {i}" for i in range(30))
+        app._on_call_event(
+            self._event(
+                "result",
+                "c1",
+                "bash",
+                result=ToolResult(call_id="c1", tool_name="bash", output=output),
+            )
+        )
+        collapsed = app.model.render(_ASCII, 80)
+        self.assertIn("more lines (Ctrl+E: expand)", collapsed)
+        self.assertNotIn("out 10", collapsed)
+        app.model.tools.toggle_expand()
+        expanded = app.model.render(_ASCII, 80)
+        self.assertIn("out 10", expanded)
+
+    def test_clear_resets_tools(self):
+        app = self._app()
+        app._on_call_event(self._event("round", step=1))
+        app._on_call_event(self._event("proposed", "c1", "bash", "{}", 1))
+        app.model.clear()
+        self.assertEqual(app.model.entries, ())
+        self.assertEqual(app.model.tools.groups, [])
+
+    def test_assistant_markdown_fragments(self):
+        app = self._app(theme=TuiTheme(colors=True, ascii_mode=False))
+        app.model.append_assistant_delta("plain **bold** `code`")
+        fragments = app.model.render_fragments(app.theme, 80)
+        styles = {style for style, _t in fragments if style}
+        self.assertIn("class:md-bold", styles)
+        self.assertIn("class:md-code", styles)
+        self.assertIn("**bold** `code`", app.model.render(app.theme, 80))
+
+    def test_approval_window_height_bounded(self):
+        from prompt_toolkit.layout.containers import ConditionalContainer, HSplit
+
+        from shadow_code.tui_tools import APPROVAL_PANEL_MAX_HEIGHT
+
+        app = self._app()
+        root = app.app.layout.container
+        self.assertIsInstance(root, HSplit)
+        conditional = [c for c in root.children if isinstance(c, ConditionalContainer)]
+        self.assertEqual(len(conditional), 1)  # panel hidden unless pending
+        height = app._approval_window.height
+        self.assertEqual(height.max, APPROVAL_PANEL_MAX_HEIGHT)
 
 
 class TestCleanExit(TuiAppCase):
