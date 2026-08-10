@@ -54,6 +54,10 @@ SHADOW_MODEL=<ollama-model-name> \
 .venv/bin/shadow-code
 ```
 
+Alternatively, `scripts/install.sh` installs (or updates) a dedicated venv
+under the XDG data dir and puts a `shadow-code` launcher on `~/.local/bin`;
+see *Operational polish (WU-12)* below for uninstall and purge.
+
 ## Current capabilities
 
 Shadow Code sends your messages to the selected local Ollama model and streams its text
@@ -419,6 +423,59 @@ invariants require a 100% pass rate, capability 60% — and any
 `safety_invariant` failure **blocks release regardless of the aggregate
 score**.
 
+### Operational polish (WU-12)
+
+Startup prints a short **authority block** naming every active authority
+boundary and every unavailable capability before the first prompt: the
+contained workspace root with its device/inode identity and containment
+mode, the granted capabilities, each withheld capability with its reason
+(`network.access` and `mcp.invoke` are never granted by this build;
+`process.execute` is withheld under `SHADOW_BASH_STRICT=1` without a kernel
+sandbox), the bash sandbox label, the mutation mode, the one-shot approval
+model, and the active prompt digest.
+
+Three slash commands cover diagnostics and recovery, in both the line REPL
+and the TUI:
+
+- `/doctor` — a redacted diagnostic report: effective configuration with
+  per-setting source (`env:` vs `default`) and any corrupt env values that
+  fell back to defaults, Ollama reachability with an actionable next step
+  (`ollama serve`, `ollama pull <model>`, or the legacy-Markdown
+  compatibility path when the model cannot serve native tool calls),
+  workspace identity and containment, granted/withheld capabilities, prompt
+  snapshot, event-store schema version (including pending-migration and
+  newer-than-this-build previews) and integrity, legacy session count, and
+  a sweep of post-crash `.shadow-tmp-*` orphans (never while a live
+  instance holds the workspace mutation lock, never inside
+  `.shadow-code-exports/`).
+- `/backup` — copies the session and event databases into a timestamped
+  directory under `~/.local/state/shadow-code/backups/` with fsync and a
+  `manifest.json` recording size and sha256 per file.
+- `/restore [dir]` — shows a **dry-run plan first** (per-database digests,
+  what would change), then writes only after an explicit one-shot
+  confirmation; without a confirmation seam it fails closed. The apply pass
+  re-verifies every backup file against its manifest digest before
+  overwriting anything, so a tampered backup refuses with nothing written.
+  With no argument the newest backup is used.
+
+Every diagnostic line, receipt, and manifest passes through redaction:
+values of secret-looking environment variables (`*TOKEN*`, `*PASSWORD*`,
+...) plus the explicit comma-separated `SHADOW_REDACT` list are replaced
+with `***` and never reach the terminal or a backup manifest.
+
+`scripts/install.sh` is the single local install/update/uninstall command
+(no sudo):
+
+```bash
+scripts/install.sh                    # install or update: venv + pip + ~/.local/bin/shadow-code
+scripts/install.sh uninstall          # remove executable and venv, PRESERVE user data
+scripts/install.sh uninstall --purge  # also delete user data, behind an interactive confirmation
+```
+
+Uninstall never deletes `~/.local/state/shadow-code` (sessions, events,
+prompt snapshots, backups) or `~/.config/shadow-code` (prompt overlays)
+unless `--purge` is given and confirmed by typing `purge`.
+
 ## Features
 
 | Feature | Description |
@@ -448,6 +505,9 @@ score**.
 /skills        List available skills
 /prompt        Inspect, reload, and roll back the system prompt
 /events        Verify event store integrity
+/doctor        Diagnose config, model, workspace, and stores (redacted)
+/backup        Back up the local databases with a manifest
+/restore [dir] Preview a database restore, then confirm to apply
 /version       Version info
 /exit          Exit
 ```
@@ -490,6 +550,7 @@ and text responses, but commands that require file or shell tools cannot execute
 | `SHADOW_MUTATION_STRICT` | disabled | Export approved file changes as reviewed patches under `.shadow-code-exports/`, never apply them |
 | `SHADOW_TUI` | disabled | Opt in to the persistent TUI (real TTYs + prompt_toolkit required) |
 | `SHADOW_ASCII` | disabled | Plain-ASCII TUI decoration (`NO_COLOR` forces this too) |
+| `SHADOW_REDACT` | empty | Comma-separated extra values redacted from `/doctor`, `/backup`, and `/restore` output |
 
 ## Architecture
 
@@ -511,6 +572,7 @@ shadow-code/
     streaming.py       Rich Live streaming display
     repl.py            prompt_toolkit REPL with history
     db.py              SQLite session persistence
+    ops.py             /doctor diagnostics, DB backup/restore, crash recovery (WU-12)
     tool_context.py    Shared state (CWD, read files)
     tools/             Legacy compatibility tool implementations
       bash.py          Shell commands with CWD tracking

@@ -1,14 +1,34 @@
 import os
 
+# Visible configuration diagnostics: a bad env value never crashes startup;
+# it falls back to the default and is reported here (surfaced by /doctor).
+CONFIG_ISSUES: list[str] = []
+
 
 def _env_flag(name: str) -> bool:
     """Return whether an opt-in environment flag is explicitly enabled."""
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """Parse an integer env override; a corrupt value degrades to default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        CONFIG_ISSUES.append(f"{name}={raw!r} is not an integer; using default {default}")
+        return default
+    if value < minimum:
+        CONFIG_ISSUES.append(f"{name}={value} is below {minimum}; using default {default}")
+        return default
+    return value
+
+
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL_NAME = os.environ.get("SHADOW_MODEL", "shadow-gemma:latest")
-CONTEXT_WINDOW = int(os.environ.get("SHADOW_CTX", "131072"))  # 128K with FlashAttention+q8
+CONTEXT_WINDOW = _env_int("SHADOW_CTX", 131072)  # 128K with FlashAttention+q8
 MAX_TOOL_TURNS = 20
 MAX_NATIVE_TOOL_TURNS = 4  # read-only admission rounds per user message
 MAX_CONSECUTIVE_ERRORS = 5
@@ -39,7 +59,7 @@ BLOCKED_PATHS = {
 }
 # num_predict: max output tokens per response. Default ~2048 is too low for code generation.
 # Set high so the model can write complete files without truncation.
-MAX_OUTPUT_TOKENS = int(os.environ.get("SHADOW_MAX_TOKENS", "8192"))
+MAX_OUTPUT_TOKENS = _env_int("SHADOW_MAX_TOKENS", 8192)
 
 MODEL_OPTIONS = {
     "temperature": 0.3,

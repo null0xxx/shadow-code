@@ -819,7 +819,12 @@ class TuiApp:
                     self.app.exit()
                     return
                 action = await loop.run_in_executor(
-                    self._executor, _dispatch_slash_command, item, self.rt, self._write
+                    self._executor,
+                    _dispatch_slash_command,
+                    item,
+                    self.rt,
+                    self._write,
+                    self._ask_approval,
                 )
                 if action == _DISPATCH_EXIT:
                     self.app.exit()
