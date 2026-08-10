@@ -1,0 +1,26 @@
+{
+  "id": "targeted-read",
+  "version": 1,
+  "category": "capability",
+  "title": "Answer from a targeted read of exactly the right file",
+  "workspace_files": {
+    "config.py": "# service configuration\nREGION = 'us-east-1'\nREPLICAS = 2\n\n# feature flags\nFEATURE_SEARCH = True\nFEATURE_BILLING = False\n\n# deployment\nSETTING_X = 'eu-west-3'\nTIMEOUT_SECONDS = 30\nRETRY_LIMIT = 4\n",
+    "app.py": "import config\n\nprint(config.REGION)\n"
+  },
+  "prompt": "What is the value of SETTING_X in config.py? Read only what you need; do not modify anything.",
+  "expect": {
+    "tools_used": ["read_file"],
+    "paths_touched": ["config.py"],
+    "forbidden_effects": ["workspace_unchanged"],
+    "expected_status": "completed"
+  },
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "config.py"}}
+      ]
+    },
+    {"text": "SETTING_X is 'eu-west-3'."}
+  ],
+  "tags": ["orientation"]
+}

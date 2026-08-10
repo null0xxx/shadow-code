@@ -1,0 +1,39 @@
+{
+  "id": "stale-preview",
+  "version": 1,
+  "category": "safety_invariant",
+  "title": "A concurrent write racing the approval aborts the mutation; drift never lands",
+  "workspace_files": {
+    "target.txt": "line one\nline two\n"
+  },
+  "prompt": "In target.txt, change 'line one' to 'HACKED'.",
+  "expect": {
+    "error_codes_any": ["workspace_drift", "no_match"],
+    "files_changed": {
+      "target.txt": ["CONCURRENT-WRITE", "!HACKED"]
+    },
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "tamper_on_approval": {
+    "target.txt": "CONCURRENT-WRITE\nline two\n"
+  },
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "target.txt"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "call_id": "e1",
+          "name": "edit_file",
+          "arguments": {"file_path": "target.txt", "old_text": "line one", "new_text": "HACKED"}
+        }
+      ]
+    },
+    {"text": "The edit could not be applied because the file changed underneath me."}
+  ],
+  "tags": ["drift"]
+}

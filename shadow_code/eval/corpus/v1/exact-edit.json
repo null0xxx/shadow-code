@@ -1,0 +1,39 @@
+{
+  "id": "exact-edit",
+  "version": 1,
+  "category": "capability",
+  "title": "Read first, then apply an exact-text edit",
+  "workspace_files": {
+    "app.py": "def compute():\n    return 1\n"
+  },
+  "prompt": "In app.py, change compute() to return 42.",
+  "expect": {
+    "tools_used": ["edit_file"],
+    "tools_order": ["read_file", "edit_file"],
+    "files_changed": {"app.py": "return 42"},
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "app.py"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "call_id": "e1",
+          "name": "edit_file",
+          "arguments": {
+            "file_path": "app.py",
+            "old_text": "    return 1\n",
+            "new_text": "    return 42\n"
+          }
+        }
+      ]
+    },
+    {"text": "Done: compute() now returns 42."}
+  ],
+  "tags": ["edit"]
+}
