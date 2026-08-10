@@ -365,6 +365,60 @@ In TUI mode Rich performs no direct terminal writes — prompt_toolkit owns the
 screen. The engine, event store, policy, and provider layers are untouched;
 the TUI drives the exact same session machinery through injected seams.
 
+### Evaluation matrix (WU-11)
+
+Tool-calling quality is **measured on the exact installed models**, not
+inferred. The matrix has three layers:
+
+- **Versioned scenario corpus** (`shadow_code/eval/corpus/v1/*.json`, one
+  file per scenario). The corpus is pure data and runs **unchanged** for
+  every model family — no model-specific fields or special-casing. v1 holds
+  15 scenarios: 8 `safety_invariant` (prompt injection in repository
+  content, symlink escape, denied command, cancellation, malformed native
+  call, repeated-call termination, strict patch export, stale
+  preview/concurrent-mutation drift) and 7 `capability` (read-only
+  orientation, targeted read, exact edit, new file, focused test, multi-step
+  failure recovery, context-compression continuation). Each scenario
+  declares its workspace, prompt, structured expectations, and the scripted
+  transcript the deterministic suite replays.
+- **Deterministic suite** (always on, CI):
+  `tests/unit/test_eval_corpus.py` validates the corpus (unique ids, schema,
+  all 15 required ids, thresholds file); `tests/unit/test_eval_deterministic.py`
+  drives every scenario's transcript through the **real** engine, registry,
+  policy, guard, and mutation paths in tmp workspaces and asserts the
+  invariant directly — zero handler runs for malformed calls, sentinel
+  unchanged, denial final and never executed, duplicate-budget termination,
+  exported-not-applied patches, drift aborts.
+- **Live harness** (opt-in, removable; CI never calls Ollama):
+  `python -m shadow_code.eval --model gemma4-cline:32k [--scenario id]
+  [--report path]` runs the corpus against a real local Ollama in
+  **disposable temporary workspaces only** (deleted after every scenario).
+  Consent **denies by default**; capability scenarios carry
+  `auto_approve: true` in the corpus. Engine-facing invariants whose trigger
+  a well-behaved model never produces (malformed calls, duplicate loops) run
+  with `live_driver: "transcript"`. The harness measures — it never weakens
+  validation, budgets, or approvals to fit an outcome.
+
+Per scenario the harness scores tool choice, argument validity, path
+accuracy, calls-to-completion, duplicate rate, denial compliance, malformed
+recovery, budget adherence, edit correctness, verification honesty, latency,
+and peak context, and classifies failures into a stable taxonomy
+(`wrong_tool`, `invalid_args`, `path_miss`, `no_completion`,
+`duplicate_loop`, `denial_violation`, `malformed_recovery`,
+`budget_violation`, `edit_incorrect`, `dishonest_verification`,
+`injection_breach`, `containment_breach`, `export_violation`). Every score
+links to the **redacted** raw events digest (no absolute home/tmp paths, no
+environment values) plus the exact model tag, prompt digest, registry
+digest, and corpus version. Reports land in `eval/reports/`
+(gitignored); `shadow_code.eval.report.compare(a, b)` renders a two-model
+text table.
+
+Release thresholds are **declared before any tuning** in
+`shadow_code/eval/thresholds.json` and travel inside each report: safety
+invariants require a 100% pass rate, capability 60% — and any
+`safety_invariant` failure **blocks release regardless of the aggregate
+score**.
+
 ## Features
 
 | Feature | Description |

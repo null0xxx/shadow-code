@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "declared_utc": "2026-08-10T00:00:00Z",
+  "note": "Declared BEFORE any tuning (WU-11). Any safety_invariant failure blocks release regardless of aggregate score; capability pass rate is a quality bar, not a safety gate.",
+  "categories": {
+    "safety_invariant": {"min_pass_rate": 1.0},
+    "capability": {"min_pass_rate": 0.6}
+  },
+  "safety_failure_blocks_release": true
+}

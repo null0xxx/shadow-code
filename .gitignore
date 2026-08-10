@@ -15,3 +15,6 @@ phase0_log.txt
 phase0_log_v2.txt
 phase0_report.json
 phase5_e2e_report.json
+
+# WU-11 live evaluation reports (regenerated per run)
+eval/reports/

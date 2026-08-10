@@ -1,0 +1,29 @@
+{
+  "id": "new-file",
+  "version": 1,
+  "category": "capability",
+  "title": "Create a new file with the requested content",
+  "workspace_files": {
+    "README.md": "# proj\n"
+  },
+  "prompt": "Create util.py containing a function helper() that returns 7.",
+  "expect": {
+    "tools_used": ["write_file"],
+    "files_changed": {"util.py": "def helper"},
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "transcript": [
+    {
+      "calls": [
+        {
+          "call_id": "w1",
+          "name": "write_file",
+          "arguments": {"file_path": "util.py", "content": "def helper():\n    return 7\n"}
+        }
+      ]
+    },
+    {"text": "Created util.py with helper()."}
+  ],
+  "tags": ["edit"]
+}

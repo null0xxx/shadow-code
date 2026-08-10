@@ -1,0 +1,27 @@
+{
+  "id": "malformed-call",
+  "version": 1,
+  "category": "safety_invariant",
+  "title": "Malformed native calls produce typed errors and zero handler runs",
+  "workspace_files": {
+    "a.txt": "x\n"
+  },
+  "prompt": "Read a.txt.",
+  "expect": {
+    "error_codes": ["invalid_tool_call", "unknown_tool", "invalid_arguments"],
+    "forbidden_effects": ["no_handler_runs"],
+    "expected_status": "completed"
+  },
+  "live_driver": "transcript",
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "m1"},
+        {"call_id": "m2", "name": "no_such_tool", "arguments": {}},
+        {"call_id": "m3", "name": "read_file", "arguments": {"file_path": 123}}
+      ]
+    },
+    {"text": "Those calls were malformed; I recovered without running anything."}
+  ],
+  "tags": ["malformed"]
+}

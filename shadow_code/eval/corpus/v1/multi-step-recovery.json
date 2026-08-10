@@ -1,0 +1,43 @@
+{
+  "id": "multi-step-recovery",
+  "version": 1,
+  "category": "capability",
+  "title": "Recover from a failed edit by reading, then editing correctly",
+  "workspace_files": {
+    "app.py": "alpha = 1\nbeta = 2\n"
+  },
+  "prompt": "In app.py, change beta = 2 to beta = 3.",
+  "expect": {
+    "error_codes": ["no_match"],
+    "files_changed": {"app.py": "beta = 3"},
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "transcript": [
+    {
+      "calls": [
+        {
+          "call_id": "e1",
+          "name": "edit_file",
+          "arguments": {"file_path": "app.py", "old_text": "beta = 20", "new_text": "beta = 3"}
+        }
+      ]
+    },
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "app.py"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "call_id": "e2",
+          "name": "edit_file",
+          "arguments": {"file_path": "app.py", "old_text": "beta = 2", "new_text": "beta = 3"}
+        }
+      ]
+    },
+    {"text": "Fixed: beta is now 3."}
+  ],
+  "tags": ["recovery"]
+}
