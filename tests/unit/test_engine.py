@@ -90,6 +90,7 @@ class EngineCase(unittest.TestCase):
             "cancel_requested": None,
             "on_round": None,
             "on_event": None,
+            "on_call_event": None,
             "event_store": None,
             "on_store_warning": None,
             "clock": itertools.count(0, 1).__next__,
@@ -107,6 +108,7 @@ class EngineCase(unittest.TestCase):
             cancel_requested=options["cancel_requested"],
             on_round=options["on_round"],
             on_event=options["on_event"],
+            on_call_event=options["on_call_event"],
             on_store_warning=options["on_store_warning"],
             clock=options["clock"],
         )
@@ -486,6 +488,74 @@ class TestCrashSemantics(EngineCase):
         # pending calls stay pending until a user decision (main's startup).
         self.assertEqual([call.call_id for call in pending], ["b1"])
         self.assertEqual(self.handler_calls, ["b1"])
+
+
+class TestCallEventSeam(EngineCase):
+    """WU-10 additive lifecycle notifications; engine decisions unchanged."""
+
+    def test_allow_and_approval_paths_notify_full_lifecycle(self) -> None:
+        events = []
+        engine = self._engine(
+            consent=lambda plan: True,
+            on_call_event=events.append,
+        )
+        outcome = engine.run_turn(
+            _scripted(
+                ProviderRound(text="", native_calls=(_READ_HELLO, _BASH_ECHO)),
+                ProviderRound(text="done"),
+            )
+        )
+        self.assertIs(outcome.status, EngineState.COMPLETED)
+
+        stages = [(event.stage, event.call_id) for event in events]
+        self.assertEqual(stages[0], ("round", ""))
+        self.assertEqual(events[0].step, 1)
+        self.assertEqual(
+            stages[1:],
+            [
+                ("proposed", "r1"),
+                ("proposed", "b1"),
+                ("executing", "r1"),
+                ("result", "r1"),
+                ("awaiting_approval", "b1"),
+                ("executing", "b1"),
+                ("result", "b1"),
+            ],
+        )
+        # Proposals carry the canonical arguments for the summary line.
+        proposed = {event.call_id: event for event in events if event.stage == "proposed"}
+        self.assertEqual(proposed["r1"].arguments_json, '{"file_path": "hello.txt"}')
+        self.assertEqual(proposed["b1"].tool_name, "bash")
+        # Terminal results carry the exact ToolResult.
+        results = {event.call_id: event.result for event in events if event.stage == "result"}
+        self.assertTrue(results["r1"].success)
+        self.assertTrue(results["b1"].success)
+
+    def test_denial_notifies_awaiting_then_terminal_result(self) -> None:
+        events = []
+        engine = self._engine(consent=lambda plan: False, on_call_event=events.append)
+        engine.run_turn(
+            _scripted(
+                ProviderRound(text="", native_calls=(_BASH_ECHO,)),
+                ProviderRound(text="done"),
+            )
+        )
+        stages = [(event.stage, event.call_id) for event in events]
+        self.assertIn(("awaiting_approval", "b1"), stages)
+        self.assertNotIn(("executing", "b1"), stages)
+        result = [event for event in events if event.stage == "result"][0].result
+        self.assertEqual(result.error.code, "approval_denied")
+
+    def test_no_callback_keeps_turn_unchanged(self) -> None:
+        engine = self._engine(consent=lambda plan: True)
+        outcome = engine.run_turn(
+            _scripted(
+                ProviderRound(text="", native_calls=(_READ_HELLO,)),
+                ProviderRound(text="done"),
+            )
+        )
+        self.assertIs(outcome.status, EngineState.COMPLETED)
+        self.assertEqual(self.handler_calls, ["r1"])
 
 
 if __name__ == "__main__":

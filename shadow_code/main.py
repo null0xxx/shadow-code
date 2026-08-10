@@ -118,7 +118,7 @@ except ImportError:
     _HAS_REPL = False
 
 try:
-    from .db import Database
+    from .db import Database, default_db_path
 
     _HAS_DB = True
 except ImportError:
@@ -196,6 +196,7 @@ class SessionRuntime:
     state: SessionState | None = None
     prompt_session: Any = None
     db: Any = None
+    db_path: Any = None  # str; the TUI opens its worker-thread Database here
     session_id: Any = None
     event_store: EventStore | None = None
     event_session_id: str = ""
@@ -1269,14 +1270,17 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
 
     # Setup DB
     db = None
+    db_path = None
     session_id = None
     if _HAS_DB:
         try:
-            db = Database()
+            db_path = default_db_path()
+            db = Database(db_path)
             session_id = db.create_session(MODEL_NAME)
         except Exception as e:
             write(f"[DB warning: {e}]")
             db = None
+            db_path = None
 
     # Event store (WU-06): append-only causal authority for resume and
     # audit. Any failure downgrades to a warning -- the store must never
@@ -1330,6 +1334,7 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
         state=state,
         prompt_session=prompt_session,
         db=db,
+        db_path=db_path,
         session_id=session_id,
         event_store=event_store,
         event_session_id=event_session_id,
