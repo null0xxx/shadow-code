@@ -27,7 +27,7 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-MODEL_NAME = os.environ.get("SHADOW_MODEL", "shadow-gemma:latest")
+MODEL_NAME = os.environ.get("SHADOW_MODEL", "gemma4-cline:32k")  # verified on the owner's Ollama
 CONTEXT_WINDOW = _env_int("SHADOW_CTX", 131072)  # 128K with FlashAttention+q8
 MAX_TOOL_TURNS = 20
 MAX_NATIVE_TOOL_TURNS = 4  # read-only admission rounds per user message

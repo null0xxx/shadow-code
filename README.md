@@ -597,13 +597,13 @@ and text responses, but commands that require file or shell tools cannot execute
 
 - Python 3.10+
 - [Ollama](https://ollama.com) with a local model
-- Default model: `shadow-gemma:latest` (configurable via `SHADOW_MODEL` env var)
+- Default model: `gemma4-cline:32k` (configurable via `SHADOW_MODEL` env var)
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `SHADOW_MODEL` | `shadow-gemma:latest` | Ollama model to use |
+| `SHADOW_MODEL` | `gemma4-cline:32k` | Ollama model to use |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API URL |
 | `SHADOW_LEGACY_MARKDOWN_TOOLS` | disabled | Opt in to the unsafe compatibility tool path |
 | `SHADOW_BASH_STRICT` | disabled | Deny shell execution when no kernel sandbox is available |
