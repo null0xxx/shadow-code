@@ -5,8 +5,12 @@
 # Falls back gracefully when Rich is not installed.
 
 import os
+from typing import TYPE_CHECKING
 
 from .theme import ERROR_SUGGESTIONS, SYMBOLS, THEME
+
+if TYPE_CHECKING:
+    from .domain.approval import ActionPlan
 
 try:
     from rich.box import MINIMAL, ROUNDED, SIMPLE
@@ -163,6 +167,65 @@ class UIRenderer:
             border_style=_t.text_muted,
             box=SIMPLE,
             title=f"[{_t.info}]diff[/{_t.info}]",
+            padding=(0, 1),
+        )
+
+    # --- Approval Panel (line REPL) ---
+
+    def render_unified_diff(self, preview: str) -> "Text":
+        """Classify unified-diff lines into theme-styled text.
+
+        Only the +/- and @@ prefixes drive classification (+++/--- file
+        headers stay plain); every other line -- bash sandbox/features
+        lines included -- passes through unstyled, so the prefixes remain
+        the semantic carrier when colors are unavailable.
+        """
+        diff = Text()
+        for index, line in enumerate(preview.split("\n")):
+            if index > 0:
+                diff.append("\n")
+            if line.startswith("@@"):
+                diff.append(line, style=f"{_t.info}")
+            elif line.startswith("+") and not line.startswith("+++"):
+                diff.append(line, style=f"{_t.diff_added}")
+            elif line.startswith("-") and not line.startswith("---"):
+                diff.append(line, style=f"{_t.diff_removed}")
+            else:
+                diff.append(line)
+        return diff
+
+    def render_approval_panel(self, plan: "ActionPlan") -> "Panel":
+        """Rich approval panel: every digest-bound fact plus styled preview.
+
+        Shows the same facts as the plain-mode prints in
+        ``main._request_approval``. The preview is sanitized and classified
+        at render time only, so ``plan.preview`` (and therefore the plan
+        digest) stays byte-identical.
+        """
+        body = Text()
+        body.append("Action requires approval:\n", style=f"bold {_t.warning}")
+        body.append(
+            f"  tool:       {plan.tool_name} v{plan.tool_version}\n",
+            style=f"bold {_t.tool}",
+        )
+        body.append(f"  capability: {plan.capability}\n", style=f"{_t.info}")
+        body.append(f"  arguments:  {plan.canonical_arguments_json}\n", style="dim")
+        body.append(
+            f"  workspace:  device={plan.workspace_device} inode={plan.workspace_inode}\n",
+            style="dim",
+        )
+        body.append(f"  plan:       sha256:{plan.digest()[:16]}...\n", style="dim")
+        preview = sanitize_terminal_text(plan.preview)
+        if preview:
+            body.append("  preview:\n")
+            body.append_text(self.render_unified_diff(preview))
+        else:
+            body.append("  preview:")
+        return Panel(
+            body,
+            border_style=_t.warning,
+            box=ROUNDED,
+            title=f"[{_t.warning}]approval[/{_t.warning}]",
             padding=(0, 1),
         )
 

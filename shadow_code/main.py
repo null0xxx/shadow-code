@@ -311,20 +311,33 @@ def _mirror_round(
         conv.add_native_tool_result(result.tool_name, result_text)
 
 
-def _request_approval(plan: ActionPlan) -> bool:
+def _request_approval(
+    plan: ActionPlan,
+    console: "Console | None" = None,
+    ui: "UIRenderer | None" = None,
+) -> bool:
     """Render the action plan and ask for a one-shot interactive approval.
 
     Fail-closed: only an explicit "y" approves; empty input, EOF, interrupt,
     or anything else denies. (The TUI routes the same decision through its
-    own approval bridge in tui.py.)
+    own approval bridge in tui.py.) With Rich available the plan renders as
+    a colored approval panel; without Rich the plain prints below stay
+    byte-identical to the historical output.
     """
-    print("Action requires approval:")
-    print(f"  tool:       {plan.tool_name} v{plan.tool_version}")
-    print(f"  capability: {plan.capability}")
-    print(f"  arguments:  {plan.canonical_arguments_json}")
-    print(f"  workspace:  device={plan.workspace_device} inode={plan.workspace_inode}")
-    print(f"  plan:       sha256:{plan.digest()[:16]}...")
-    print(f"  preview:    {plan.preview}")
+    if _RICH:
+        if console is None:
+            console = Console()
+        if ui is None:
+            ui = UIRenderer()
+        console.print(ui.render_approval_panel(plan))
+    else:
+        print("Action requires approval:")
+        print(f"  tool:       {plan.tool_name} v{plan.tool_version}")
+        print(f"  capability: {plan.capability}")
+        print(f"  arguments:  {plan.canonical_arguments_json}")
+        print(f"  workspace:  device={plan.workspace_device} inode={plan.workspace_inode}")
+        print(f"  plan:       sha256:{plan.digest()[:16]}...")
+        print(f"  preview:    {plan.preview}")
     try:
         answer = input("Approve this exact action? [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1232,13 +1245,14 @@ def _run_line_loop(rt: SessionRuntime) -> None:
 
     # Bounded engine (WU-07): drives the native tool rounds of each user
     # turn. All I/O seams are injected -- consent is the interactive
-    # approval prompt, cancellation reads the SIGINT flag.
+    # approval prompt, cancellation reads the SIGINT flag. The lambda keeps
+    # a late-bound reference so tests can patch _request_approval.
     rt.engine = AgentEngine(
         rt.registry,
         rt.policy_engine,
         rt.execution_context,
         rt.approval_authority,
-        consent=_request_approval,
+        consent=lambda plan: _request_approval(plan, rt.console, rt.ui),
         event_store=rt.event_store,
         event_session_id=rt.event_session_id,
         cancel_requested=lambda: rt.interrupted,
