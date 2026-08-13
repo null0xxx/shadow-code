@@ -10,6 +10,8 @@ from .theme import ERROR_SUGGESTIONS, SYMBOLS, THEME
 
 try:
     from rich.box import MINIMAL, ROUNDED, SIMPLE
+    from rich.console import Group
+    from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -19,6 +21,7 @@ except ImportError:
     HAS_RICH = False
 
 from .config import MODEL_NAME
+from .terminal_text import sanitize_terminal_text
 
 _t = THEME
 _s = SYMBOLS
@@ -81,11 +84,19 @@ class UIRenderer:
 
     # --- Response ---
 
-    def render_response(self, text: str, tokens: int = 0) -> "Text":
-        result = self._prefix_text(text)
+    def render_response(self, text: str, tokens: int = 0) -> "Group":
+        """Render the final assistant response as Markdown.
+
+        The text is sanitized BEFORE Markdown construction so injected
+        terminal control sequences can never reach the console (storage
+        keeps the raw bytes; sanitization is render-time only). The token
+        count is a plain Text sibling below the Markdown body.
+        """
+        body = Markdown(sanitize_terminal_text(text))
         if tokens:
-            result.append(f"\n{'':>50}{tokens:,} tokens", style="dim")
-        return result
+            token_line = Text(f"{'':>50}{tokens:,} tokens", style="dim")
+            return Group(body, token_line)
+        return Group(body)
 
     # --- Tool Calls (Claude Code style: ⎿ prefix) ---
 
