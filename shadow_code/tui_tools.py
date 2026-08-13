@@ -21,27 +21,7 @@ from typing import Any
 
 from wcwidth import wcswidth, wcwidth
 
-# -- terminal text sanitization (moved from tui.py; tui.py re-exports) ------
-
-_OSC_RE = re.compile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
-_CSI_RE = re.compile("\x1b\\[[0-?]*[ -/]*[@-~]")
-# Remaining C0 controls (incl. stray ESC and CR) and C1 controls; \n and
-# \t are legitimate transcript content and survive.
-_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]")
-
-
-def sanitize_terminal_text(text: str) -> str:
-    """Neutralize terminal control sequences in model/tool output.
-
-    OSC (title/set-clipboard) and CSI (colors, cursor moves) sequences are
-    removed entirely; any remaining control character except newline and
-    tab is stripped. The result can never inject terminal control into the
-    transcript, regardless of what a provider or a tool produced.
-    """
-    text = _OSC_RE.sub("", text)
-    text = _CSI_RE.sub("", text)
-    return _CTRL_RE.sub("", text)
-
+from .terminal_text import sanitize_terminal_text
 
 # -- theme tokens -------------------------------------------------------------
 
