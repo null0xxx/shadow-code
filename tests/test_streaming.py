@@ -1,5 +1,7 @@
 """Tests for streaming.py -- Rich Live streaming controller."""
 
+import io
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -45,6 +47,21 @@ class TestStreamControllerPlain(unittest.TestCase):
         with patch("shadow_code.streaming.HAS_RICH", False):
             resp, _ = ctrl.stream_response([], "system")
         self.assertEqual(resp, "test")
+
+    def test_stream_plain_sanitizes_stdout_but_returns_raw(self):
+        raw = "Hello \x1b[31mworld\x1b]0;evil\x07!"
+        ctrl = self._make_controller([raw])
+        captured = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = captured
+            resp, _ = ctrl._stream_plain([], "system")
+        finally:
+            sys.stdout = old
+        # Returned response is byte-identical to the raw model output...
+        self.assertEqual(resp, raw)
+        # ...while the terminal saw sanitized text (plus the trailing print()).
+        self.assertEqual(captured.getvalue(), "Hello world!\n")
 
     def test_stream_plain_flushes_and_raises_typed_cancellation(self):
         client = MagicMock()
@@ -119,6 +136,29 @@ class TestStreamControllerRich(unittest.TestCase):
         ui.render_streaming_with_tokens.assert_any_call("Hello ", 1)
         ui.render_response.assert_called_once_with("Hello world", 17)
         console.print.assert_called_once_with(("Hello world", 17))
+
+    def test_rich_stream_sanitizes_visible_text_but_returns_raw(self):
+        live = MagicMock()
+        live.__enter__.return_value = live
+        live.__exit__.return_value = False
+        client = MagicMock()
+        client.chat_stream.return_value = iter(["Hello \x1b[31", "mworld\x07"])
+        client.last_eval_tokens = 5
+        ui = MagicMock()
+        ui.render_thinking.return_value = "thinking"
+        ui.render_streaming_with_tokens.side_effect = lambda text, tokens: (text, tokens)
+        ui.render_response.side_effect = lambda text, tokens: (text, tokens)
+        console = MagicMock()
+        ctrl = StreamController(client, ui, console=console)
+
+        with patch("shadow_code.streaming.Live", return_value=live):
+            response, tokens = ctrl._stream_rich([], "system")
+
+        # Stored response keeps the raw bytes (incl. the split CSI sequence)...
+        self.assertEqual(response, "Hello \x1b[31mworld\x07")
+        # ...while the visible text fed to Live and the final print is clean.
+        self.assertEqual(tokens, 5)
+        ui.render_response.assert_called_once_with("Hello world", 5)
 
     def test_rich_stream_with_only_hidden_call_does_not_print_response(self):
         live = MagicMock()
