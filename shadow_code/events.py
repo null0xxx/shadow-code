@@ -131,6 +131,20 @@ class ContextSnapshotPayload(FrozenModel):
     created_utc: str
 
 
+class McpServerPayload(FrozenModel):
+    """Lifecycle record for one configured MCP server (WU-13).
+
+    Appended at session start with the discovery outcome (ready /
+    unavailable / empty) and at session end when the owned client and its
+    process group are closed. It carries no call_id: MCP tool calls flow
+    through the same proposal/policy/approval/result events as built-ins.
+    """
+
+    server: str
+    status: str
+    detail: str = ""
+
+
 _PAYLOAD_MODELS: dict[str, type[FrozenModel]] = {
     "session_started": SessionStartedPayload,
     "user_message": UserMessagePayload,
@@ -145,6 +159,7 @@ _PAYLOAD_MODELS: dict[str, type[FrozenModel]] = {
     "session_ended": SessionEndedPayload,
     "imported_message": ImportedMessagePayload,
     "context_snapshot": ContextSnapshotPayload,
+    "mcp_server": McpServerPayload,
 }
 
 # Event types that close a proposed tool call.

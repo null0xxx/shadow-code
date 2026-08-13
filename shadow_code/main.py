@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
-from . import ops
+from . import mcp, ops
 from . import tools as tool_reg
 from .config import (
     BASH_STRICT,
@@ -65,6 +65,7 @@ from .events import (
     AssistantTextPayload,
     EventStore,
     EventStoreError,
+    McpServerPayload,
     NewEvent,
     SessionEndedPayload,
     SessionStartedPayload,
@@ -148,7 +149,9 @@ def _legacy_markdown_protocol_error(
     )
 
 
-def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Capability]:
+def _granted_capabilities(
+    bash_strict: bool, sandbox_label: str, *, mcp_active: bool = False
+) -> frozenset[Capability]:
     """Granted capabilities; bash strict mode withholds shell execution.
 
     Bash strict mode denies shell execution entirely when no kernel
@@ -156,7 +159,9 @@ def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Ca
     bash with CAPABILITY_NOT_GRANTED instead of running it unconfined.
     Mutation strict mode keeps FILESYSTEM_WRITE granted: approved changes
     are exported as reviewed patches instead of being applied, so the
-    capability is still required on the admission path.
+    capability is still required on the admission path. MCP_INVOKE is
+    granted only when at least one configured MCP server discovered usable
+    tools this session; every MCP call still requires one-shot approval.
     """
     granted = {
         Capability.FILESYSTEM_READ,
@@ -165,12 +170,16 @@ def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Ca
     }
     if bash_strict and sandbox_label == "unconfined":
         granted.discard(Capability.PROCESS_EXECUTE)
+    if mcp_active:
+        granted.add(Capability.MCP_INVOKE)
     return frozenset(granted)
 
 
-def _authority_facts(sandbox_label: str) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+def _authority_facts(
+    sandbox_label: str, *, mcp_active: bool = False
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """Granted capability values plus every withheld capability and its reason."""
-    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label, mcp_active=mcp_active)
     granted = tuple(sorted(capability.value for capability in capabilities))
     withheld: list[tuple[str, str]] = []
     if Capability.PROCESS_EXECUTE not in capabilities:
@@ -181,7 +190,8 @@ def _authority_facts(sandbox_label: str) -> tuple[tuple[str, ...], tuple[tuple[s
             )
         )
     withheld.append((Capability.NETWORK_ACCESS.value, "not supported by this build"))
-    withheld.append((Capability.MCP_INVOKE.value, "not supported by this build"))
+    if Capability.MCP_INVOKE not in capabilities:
+        withheld.append((Capability.MCP_INVOKE.value, "no MCP servers configured"))
     return granted, tuple(withheld)
 
 
@@ -192,7 +202,9 @@ def _doctor_facts(rt: "SessionRuntime") -> ops.DoctorFacts:
     prompt_manager = rt.prompt_manager
     if guard is None or exec_ctx is None or prompt_manager is None:
         raise RuntimeError("doctor requires a fully bootstrapped runtime")
-    granted, withheld = _authority_facts(exec_ctx.sandbox_label)
+    mcp_manager = rt.mcp_manager
+    mcp_active = mcp_manager is not None and bool(mcp_manager.ready_servers)
+    granted, withheld = _authority_facts(exec_ctx.sandbox_label, mcp_active=mcp_active)
     ok, message = rt.client.health_check() if rt.client is not None else (False, "no client")
     return ops.DoctorFacts(
         workspace_root=exec_ctx.workspace_root,
@@ -212,6 +224,7 @@ def _doctor_facts(rt: "SessionRuntime") -> ops.DoctorFacts:
         events_db_path=str(rt.events_db_path) if rt.events_db_path else None,
         legacy_db_path=rt.db_path,
         event_store=rt.event_store,
+        mcp_servers=mcp_manager.report_lines() if mcp_manager is not None else (),
     )
 
 
@@ -252,6 +265,7 @@ class SessionRuntime:
     # Deferred factory: tests patch main.Conversation before main() runs.
     conv: Conversation = field(default_factory=lambda: Conversation())
     engine: AgentEngine | None = None
+    mcp_manager: mcp.McpManager | None = None
     permission_labels: tuple[str, ...] = ()
     first_message: bool = True
     interrupted: bool = False
@@ -1316,10 +1330,24 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
     except WorkspaceAccessError as e:
         print(f"Error: cannot establish workspace containment: {e}", file=sys.stderr)
         sys.exit(1)
-    runtime_registry = ToolRegistry((READ_FILE_SPEC, WRITE_FILE_SPEC, EDIT_FILE_SPEC, BASH_SPEC))
+    builtin_specs = (READ_FILE_SPEC, WRITE_FILE_SPEC, EDIT_FILE_SPEC, BASH_SPEC)
+    runtime_registry = ToolRegistry(builtin_specs)
+    # MCP adapter (WU-13): discover configured stdio servers and register
+    # their sanitized tools as namespaced specs in the SAME registry, so
+    # policy, approval, events, and budgets apply identically. Discovery
+    # never blocks startup: a failing server is reported unavailable.
+    mcp_manager = mcp.McpManager.discover(
+        mcp.default_mcp_config_path(),
+        reserved_names=frozenset(spec.name for spec in builtin_specs),
+    )
+    if mcp_manager.specs:
+        runtime_registry = ToolRegistry((*runtime_registry.specs, *mcp_manager.specs))
+    mcp_active = bool(mcp_manager.ready_servers)
+    for line in mcp_manager.report_lines():
+        write(f"[mcp] {line}")
     process_env = build_process_env()
     sandbox_label = detect_sandbox()
-    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label, mcp_active=mcp_active)
     policy_engine = PolicyEngine(PolicyFacts(capabilities, workspace_guard.identity))
     execution_context = WorkspaceContext(
         guard=workspace_guard,
@@ -1438,6 +1466,7 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
         if not _resolve_pending_events(event_store):
             event_store.close()
             workspace_guard.close()
+            mcp_manager.close()
             if db:
                 db.close()
             return
@@ -1453,6 +1482,22 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
             ],
             write,
         )
+        # Record the MCP discovery outcome for this session (WU-13).
+        if mcp_manager.statuses:
+            _emit(
+                event_store,
+                event_session_id,
+                [
+                    NewEvent(
+                        "mcp_server",
+                        McpServerPayload(
+                            server=status.name, status=status.state, detail=status.detail
+                        ),
+                    )
+                    for status in mcp_manager.statuses
+                ],
+                write,
+            )
     except (EventStoreError, OSError) as e:
         write(f"[events warning: {e}]")
         event_store = None
@@ -1460,7 +1505,7 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
     # Startup authority block (WU-12): name every active authority boundary
     # and every unavailable capability before the first prompt, so the owner
     # always sees exactly what this session may and may not do.
-    granted, withheld = _authority_facts(sandbox_label)
+    granted, withheld = _authority_facts(sandbox_label, mcp_active=mcp_active)
     for line in ops.authority_summary(
         workspace_root=cwd,
         device=workspace_guard.identity.device,
@@ -1504,6 +1549,7 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
         event_store=event_store,
         event_session_id=event_session_id,
         events_db_path=events_db_path,
+        mcp_manager=mcp_manager,
         permission_labels=tuple(permission_labels),
     )
 
@@ -1522,7 +1568,24 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
     else:
         _run_line_loop(rt)
 
-    # Cleanup (shared by both frontends)
+    # Cleanup (shared by both frontends). MCP cleanup comes first: every
+    # owned client/process group is killed and recorded before the session
+    # closes, so the event log shows exactly which servers were terminated.
+    closed_servers = mcp_manager.close()
+    if closed_servers:
+        _emit(
+            event_store,
+            event_session_id,
+            [
+                NewEvent(
+                    "mcp_server",
+                    McpServerPayload(
+                        server=name, status="closed", detail="process group terminated"
+                    ),
+                )
+                for name in closed_servers
+            ],
+        )
     _emit(
         event_store,
         event_session_id,
