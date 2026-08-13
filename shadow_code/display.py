@@ -5,12 +5,56 @@
 # full response collection. Legacy ```tool_call hiding is kept for
 # backward compatibility with models that don't support native tools.
 
+import json
+import re
 import sys
 
 # The opening marker: three backticks followed by "tool_call"
 TAG_START = "```tool_call"
 # The closing marker: three backticks on their own line (after tool_call block)
 TAG_END = "```"
+
+# Candidate fences for the fake tool-call notice: ```json or untagged blocks.
+# ```tool_call fences are excluded on purpose -- the legacy protocol-error
+# path (main._legacy_markdown_protocol_error) already reports those, and
+# double-reporting is a bug.
+_TEXT_TOOL_CALL_FENCE_RE = re.compile(
+    r"^```(?:json)?[ \t]*\r?\n(.*?)^```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _looks_like_tool_call(value: object) -> bool:
+    """True for {"tool_call": ...} or {"tool": ..., "params"/"arguments": ...}."""
+    if not isinstance(value, dict):
+        return False
+    if "tool_call" in value:
+        return True
+    if not isinstance(value.get("tool"), str):
+        return False
+    return isinstance(value.get("params"), dict) or isinstance(value.get("arguments"), dict)
+
+
+def detect_text_tool_call_fence(text: str) -> int:
+    """Count fenced blocks that look like tool calls emitted as plain text.
+
+    Only ```json and untagged fences are inspected; the body must parse as a
+    JSON dict with a "tool_call" key (or a {"tool", "params"/"arguments"}
+    shape), or a list of such dicts -- each matching dict counts once.
+    Malformed JSON is ignored. The result is purely observational: it feeds a
+    display notice and never the parser, and the text is never mutated.
+    """
+    count = 0
+    for match in _TEXT_TOOL_CALL_FENCE_RE.finditer(text):
+        try:
+            body = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(body, list):
+            count += sum(1 for item in body if _looks_like_tool_call(item))
+        elif _looks_like_tool_call(body):
+            count += 1
+    return count
 
 
 class StreamDisplay:

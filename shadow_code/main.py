@@ -49,7 +49,7 @@ from .context_compaction import (
     validate_snapshot,
 )
 from .conversation import COMPACTION_RATIO, Conversation
-from .display import TAG_START, StreamDisplay
+from .display import TAG_START, StreamDisplay, detect_text_tool_call_fence
 from .domain.approval import ActionPlan, ApprovalAuthority
 from .domain.policy import PolicyFacts, WorkspaceAccessError
 from .domain.tools import Capability, ToolError, ToolResult
@@ -1135,6 +1135,17 @@ def _handle_user_message(
                         console.print(ui.render_error(protocol_error.message))
                     else:
                         write(f"[{protocol_error.code}] {protocol_error.message}")
+                else:
+                    # Display-only notice: the model emitted what looks like
+                    # tool calls as fenced text. Nothing was executed and the
+                    # stored response stays byte-identical to the model output.
+                    text_calls = detect_text_tool_call_fence(resp)
+                    if text_calls:
+                        write(
+                            f"[notice: the model emitted what looks like "
+                            f"{text_calls} tool call(s) as text; nothing was executed "
+                            f"-- rephrase or ask it to use real tool calls]"
+                        )
                 break  # Pure text response, done
 
             # Execute markdown tool calls (legacy path)
