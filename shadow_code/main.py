@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
+from . import ops
 from . import tools as tool_reg
 from .config import (
     BASH_STRICT,
@@ -165,6 +166,53 @@ def _granted_capabilities(bash_strict: bool, sandbox_label: str) -> frozenset[Ca
     if bash_strict and sandbox_label == "unconfined":
         granted.discard(Capability.PROCESS_EXECUTE)
     return frozenset(granted)
+
+
+def _authority_facts(sandbox_label: str) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Granted capability values plus every withheld capability and its reason."""
+    capabilities = _granted_capabilities(BASH_STRICT, sandbox_label)
+    granted = tuple(sorted(capability.value for capability in capabilities))
+    withheld: list[tuple[str, str]] = []
+    if Capability.PROCESS_EXECUTE not in capabilities:
+        withheld.append(
+            (
+                Capability.PROCESS_EXECUTE.value,
+                "SHADOW_BASH_STRICT=1, no sandbox (bwrap/firejail) available",
+            )
+        )
+    withheld.append((Capability.NETWORK_ACCESS.value, "not supported by this build"))
+    withheld.append((Capability.MCP_INVOKE.value, "not supported by this build"))
+    return granted, tuple(withheld)
+
+
+def _doctor_facts(rt: "SessionRuntime") -> ops.DoctorFacts:
+    """Snapshot the live runtime into the facts the doctor report consumes."""
+    guard = rt.workspace_guard
+    exec_ctx = rt.execution_context
+    prompt_manager = rt.prompt_manager
+    if guard is None or exec_ctx is None or prompt_manager is None:
+        raise RuntimeError("doctor requires a fully bootstrapped runtime")
+    granted, withheld = _authority_facts(exec_ctx.sandbox_label)
+    ok, message = rt.client.health_check() if rt.client is not None else (False, "no client")
+    return ops.DoctorFacts(
+        workspace_root=exec_ctx.workspace_root,
+        workspace_device=guard.identity.device,
+        workspace_inode=guard.identity.inode,
+        containment="openat2",
+        granted=granted,
+        withheld=withheld,
+        sandbox_label=exec_ctx.sandbox_label,
+        mutation_mode=exec_ctx.mutation_mode,
+        model_name=MODEL_NAME,
+        ollama_ok=ok,
+        ollama_message=message,
+        prompt_digest=prompt_manager.active.digest,
+        prompt_layer_count=len(prompt_manager.active.sources),
+        prompt_store_path=str(prompt_manager.store.root),
+        events_db_path=str(rt.events_db_path) if rt.events_db_path else None,
+        legacy_db_path=rt.db_path,
+        event_store=rt.event_store,
+    )
 
 
 @dataclass
@@ -558,6 +606,61 @@ def _show_context_diagnostics(
         write(f"  issue: {issue}")
 
 
+def _restore_backup_dir(arg: str) -> str | None:
+    """Explicit backup directory, or the newest one under the default root."""
+    if arg:
+        return os.path.expanduser(arg)
+    root = ops.default_backup_root()
+    backups = sorted(root.glob("shadow-code-backup-*")) if root.is_dir() else []
+    return str(backups[-1]) if backups else None
+
+
+def _handle_restore_command(
+    user_input: str,
+    rt: SessionRuntime,
+    write: Callable[[str], None],
+    confirm: Callable[[str], bool] | None,
+) -> None:
+    """Preview a database restore, then apply only on explicit confirmation.
+
+    Same approval discipline as the tool pipeline: the dry-run plan is shown
+    first and nothing is written until the user explicitly confirms. The
+    apply pass re-verifies every backup file against its manifest digest
+    before overwriting a single byte, so a tampered backup fails closed.
+    """
+    directory = _restore_backup_dir(user_input[len("/restore") :].strip())
+    if directory is None:
+        write("  No backups found; run /backup first or pass /restore <dir>")
+        return
+    sentinels = ops.collect_sentinels()
+    sessions_path = rt.db_path
+    events_path = str(rt.events_db_path) if rt.events_db_path else None
+    try:
+        plan = ops.restore_databases(
+            directory, sessions_path=sessions_path, events_path=events_path
+        )
+    except ops.OpsError as exc:
+        write(f"[restore failed ({exc.code}): {exc.message}]")
+        return
+    for line in ops.render_restore_plan(plan, sentinels).splitlines():
+        write(line)
+    if not any(action.would_change for action in plan.actions):
+        write("  Nothing to restore; all databases already match the backup")
+        return
+    if confirm is None or not confirm("  Apply this restore? [y/N] "):
+        write("  Restore NOT applied; no changes written")
+        return
+    try:
+        applied = ops.restore_databases(
+            directory, sessions_path=sessions_path, events_path=events_path, apply=True
+        )
+    except ops.OpsError as exc:
+        write(f"[restore failed ({exc.code}): {exc.message}]")
+        return
+    for line in ops.render_restore_plan(applied, sentinels).splitlines():
+        write(line)
+
+
 # Slash dispatch outcomes; the frontend decides how to render each one.
 _DISPATCH_EXIT = "exit"
 _DISPATCH_CLEAR = "clear"
@@ -565,14 +668,19 @@ _DISPATCH_HANDLED = "handled"
 
 
 def _dispatch_slash_command(
-    user_input: str, rt: SessionRuntime, write: Callable[[str], None]
+    user_input: str,
+    rt: SessionRuntime,
+    write: Callable[[str], None],
+    confirm: Callable[[str], bool] | None = None,
 ) -> str | tuple[str, str]:
     """Handle a slash command; both frontends share this exact dispatch.
 
     Returns "exit" to leave the session, "clear" when the frontend should
     also clear its own screen, "handled" when the command was fully dealt
     with, or ("message", text) when the input falls through to the model
-    (a skill command expands into its prompt template).
+    (a skill command expands into its prompt template). ``confirm`` is the
+    frontend's one-shot y/N seam used by /restore; without it, destructive
+    confirmations fail closed.
     """
     if user_input == "/exit":
         return _DISPATCH_EXIT
@@ -712,6 +820,9 @@ def _dispatch_slash_command(
             ("/skills", "List available skills"),
             ("/prompt <sub>", "Inspect/reload/rollback the system prompt"),
             ("/events", "Verify event store integrity"),
+            ("/doctor", "Diagnose config, model, workspace, and stores"),
+            ("/backup", "Back up the local databases with a manifest"),
+            ("/restore [dir]", "Preview a database restore, then confirm to apply"),
         ]
         # Add skills
         for skill_name, skill_desc in list_skills():
@@ -805,6 +916,39 @@ def _dispatch_slash_command(
                 write(f"  event store OK: {count} events, integrity verified")
         else:
             write("  [event store not available]")
+        return _DISPATCH_HANDLED
+
+    if user_input == "/doctor":
+        # WU-12: redacted diagnostic report; a broken store or unreachable
+        # Ollama shows up as report content, never as a session failure.
+        try:
+            report = ops.doctor(_doctor_facts(rt))
+        except Exception as exc:
+            write(f"[doctor failed: {exc}]")
+            return _DISPATCH_HANDLED
+        for line in ops.render_doctor(report).splitlines():
+            write(line)
+        return _DISPATCH_HANDLED
+
+    if user_input == "/backup":
+        sentinels = ops.collect_sentinels()
+        try:
+            receipt = ops.backup_databases(
+                sessions_path=rt.db_path,
+                events_path=str(rt.events_db_path) if rt.events_db_path else None,
+                dest_root=ops.default_backup_root(),
+                prompt_store_dir=prompt_manager.store.root,
+                sentinels=sentinels,
+            )
+        except ops.OpsError as exc:
+            write(f"[backup failed ({exc.code}): {exc.message}]")
+            return _DISPATCH_HANDLED
+        for line in ops.render_backup_receipt(receipt, sentinels).splitlines():
+            write(line)
+        return _DISPATCH_HANDLED
+
+    if user_input.startswith("/restore"):
+        _handle_restore_command(user_input, rt, write, confirm)
         return _DISPATCH_HANDLED
 
     if user_input.startswith("/prompt"):
@@ -1142,7 +1286,7 @@ def _run_line_loop(rt: SessionRuntime) -> None:
         if not user_input:
             continue
 
-        action = _dispatch_slash_command(user_input, rt, print)
+        action = _dispatch_slash_command(user_input, rt, print, _input_confirm)
         if action == _DISPATCH_EXIT:
             break
         if action == _DISPATCH_CLEAR:
@@ -1313,7 +1457,28 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
         write(f"[events warning: {e}]")
         event_store = None
 
-    write("Commands: /help /clear /exit /tokens /save /load /list /info /prompt /events /context\n")
+    # Startup authority block (WU-12): name every active authority boundary
+    # and every unavailable capability before the first prompt, so the owner
+    # always sees exactly what this session may and may not do.
+    granted, withheld = _authority_facts(sandbox_label)
+    for line in ops.authority_summary(
+        workspace_root=cwd,
+        device=workspace_guard.identity.device,
+        inode=workspace_guard.identity.inode,
+        containment="openat2",
+        granted=granted,
+        withheld=withheld,
+        sandbox_label=sandbox_label,
+        mutation_mode=execution_context.mutation_mode,
+        prompt_digest=prompt_manager.active.digest,
+        sentinels=ops.collect_sentinels(),
+    ):
+        write(line)
+
+    write(
+        "Commands: /help /clear /exit /tokens /save /load /list /info /prompt "
+        "/events /context /doctor /backup /restore\n"
+    )
 
     rt = SessionRuntime(
         cwd=cwd,
