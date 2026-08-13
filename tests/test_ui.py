@@ -93,9 +93,14 @@ class TestUIRenderer(unittest.TestCase):
 
         from rich.console import Console
 
-        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+        # rich honors NO_COLOR by stripping color SGRs but keeps bold/dim
+        # attributes; only a dumb terminal suppresses all escape output.
+        # Pin TERM=dumb so the assertion is independent of the runner env
+        # (CI runners have no TERM; dev shells vary).
+        with patch.dict(os.environ, {"NO_COLOR": "1", "TERM": "dumb"}):
             buf = io.StringIO()
             console = Console(file=buf, force_terminal=True, width=100)
+            self.assertTrue(console.no_color)
             console.print(self.ui.render_response("**bold** plain", tokens=5))
         self.assertNotIn("\x1b", buf.getvalue())
         self.assertIn("bold", buf.getvalue())
