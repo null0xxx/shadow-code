@@ -9,6 +9,8 @@ import json
 import re
 import sys
 
+from .terminal_text import sanitize_terminal_text, split_trailing_partial_escape
+
 # The opening marker: three backticks followed by "tool_call"
 TAG_START = "```tool_call"
 # The closing marker: three backticks on their own line (after tool_call block)
@@ -73,12 +75,14 @@ class StreamDisplay:
         self.buffer = ""
         self.buffering = False  # True when inside a ```tool_call block
         self.full_response = ""  # Accumulates ALL chunks (including hidden ones)
+        self._esc_held = ""  # Trailing partial escape sequence held back from the terminal
 
     def reset(self):
         """Reset state for a new streaming response."""
         self.buffer = ""
         self.buffering = False
         self.full_response = ""
+        self._esc_held = ""
 
     def feed(self, chunk: str):
         """Process a streaming chunk. Shows text to user, hides tool_call blocks."""
@@ -106,8 +110,7 @@ class StreamDisplay:
                 if end_of_close != -1:
                     remaining = after_close[end_of_close + 1 :]
                     if remaining:
-                        sys.stdout.write(remaining)
-                        sys.stdout.flush()
+                        self._write_terminal(remaining)
                 else:
                     # closing ``` is at the very end, no trailing text
                     pass
@@ -123,8 +126,7 @@ class StreamDisplay:
             # Found ```tool_call -- show everything before it, start buffering
             before = combined[:idx]
             if before:
-                sys.stdout.write(before)
-                sys.stdout.flush()
+                self._write_terminal(before)
             self.buffering = True
             self.buffer = combined[idx:]
             return
@@ -133,8 +135,7 @@ class StreamDisplay:
         # We need to hold back characters that could be the start of ```tool_call
         safe, held = self._split_partial(combined)
         if safe:
-            sys.stdout.write(safe)
-            sys.stdout.flush()
+            self._write_terminal(safe)
         self.buffer = held
 
     def _find_closing_backticks(self, text: str) -> int | None:
@@ -175,6 +176,26 @@ class StreamDisplay:
                 return text[:-i], text[-i:]
         return text, ""
 
+    def _write_terminal(self, text: str, *, final: bool = False):
+        """Write text to the terminal, sanitized at the write point.
+
+        full_response keeps the raw model bytes; this is the single choke
+        point where terminal-bound output is neutralized. A trailing partial
+        escape sequence is held back (self._esc_held) until the next write so
+        a sequence split across chunks is stripped whole instead of leaking
+        its remains as visible garbage. With final=True (end of stream) the
+        hold-back is resolved through the sanitizer instead, which matches
+        whole-text sanitization of the same bytes.
+        """
+        if self._esc_held:
+            text = self._esc_held + text
+            self._esc_held = ""
+        if not final:
+            text, self._esc_held = split_trailing_partial_escape(text)
+        if text:
+            sys.stdout.write(sanitize_terminal_text(text))
+            sys.stdout.flush()
+
     def flush(self):
         """Flush any remaining buffer to the terminal.
 
@@ -183,9 +204,14 @@ class StreamDisplay:
         extract it from full_response.
         """
         if self.buffer and not self.buffering:
-            # Not inside a tool call block -- safe to print remaining buffer
-            sys.stdout.write(self.buffer)
-            sys.stdout.flush()
+            # Not inside a tool call block -- safe to print remaining buffer.
+            # final=True resolves any held-back partial escape through the
+            # sanitizer instead of holding it further.
+            self._write_terminal(self.buffer, final=True)
+        elif self._esc_held:
+            # Swallowing an unclosed tool_call block; still resolve a dangling
+            # held-back escape fragment through the sanitizer.
+            self._write_terminal("", final=True)
         # If buffering is True, we swallow the incomplete tool call block
         # (the parser will handle it from full_response)
         self.buffer = ""

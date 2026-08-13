@@ -5,6 +5,7 @@ import sys
 import unittest
 
 from shadow_code.display import TAG_END, TAG_START, StreamDisplay
+from shadow_code.terminal_text import split_trailing_partial_escape
 
 
 class TestStreamDisplayBasic(unittest.TestCase):
@@ -218,6 +219,102 @@ class TestFindClosingBackticks(unittest.TestCase):
         # ```python is an opening, not a closing
         result = self.display._find_closing_backticks("```python\n")
         self.assertIsNone(result)
+
+
+class TestStreamDisplaySanitization(unittest.TestCase):
+    """Terminal-bound writes are sanitized; full_response stays raw."""
+
+    def setUp(self):
+        self.display = StreamDisplay()
+        self.display.reset()
+
+    def _capture(self, chunks):
+        captured = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = captured
+            for chunk in chunks:
+                self.display.feed(chunk)
+            self.display.flush()
+        finally:
+            sys.stdout = old
+        return captured.getvalue()
+
+    def test_control_sequences_stripped_from_terminal_output(self):
+        raw = "Hello \x1b[31mred\x1b[0m \x1b]0;evil title\x07world\x07\x0b!"
+        output = self._capture([raw])
+        self.assertEqual(output, "Hello red world!")
+        # Stored response is byte-identical to the raw model output.
+        self.assertEqual(self.display.get_full_response(), raw)
+
+    def test_escape_sequence_split_across_chunks(self):
+        cases = [
+            (["hello\x1b[31", "mworld"], "helloworld"),  # CSI split
+            (["a\x1b]0;ti", "tle\x07b"], "ab"),  # OSC split, BEL terminator
+            (["a\x1b]0;x\x1b", "\\b"], "ab"),  # OSC split, ST terminator
+            (["a\x1b", "[2Kb"], "ab"),  # bare ESC at chunk boundary
+            (["a\x1b[1;", "2 Hb"], "ab"),  # CSI params + intermediate split
+        ]
+        for chunks, expected in cases:
+            with self.subTest(chunks=chunks):
+                self.display.reset()
+                output = self._capture(chunks)
+                self.assertEqual(output, expected)
+                self.assertEqual(self.display.get_full_response(), "".join(chunks))
+
+    def test_fence_hiding_with_sanitization(self):
+        block = '```tool_call\n{"tool": "bash", "params": {"command": "ls \x1b[2K"}}\n```'
+        output = self._capture(["ok\x1b[31m\n" + block, "\ndone\x07"])
+        self.assertEqual(output, "ok\ndone")
+        full = self.display.get_full_response()
+        self.assertIn('"tool"', full)
+        self.assertIn("\x1b[2K", full)
+
+    def test_normal_text_unchanged_byte_for_byte(self):
+        chunks = ["Hello, ", "wor", "ld!\nSecond ", "line `", "code`."]
+        output = self._capture(chunks)
+        self.assertEqual(output, "".join(chunks))
+
+    def test_flush_writes_held_buffer_sanitized(self):
+        # "`" is held back as a potential ```tool_call prefix until flush.
+        output = self._capture(["abc`"])
+        self.assertEqual(output, "abc`")
+
+    def test_flush_resolves_dangling_escape(self):
+        # Stream ends mid-sequence: the held fragment goes through the
+        # sanitizer, matching whole-text sanitization of the same bytes.
+        output = self._capture(["tail\x1b[31"])
+        self.assertEqual(output, "tail[31")
+        self.assertEqual(self.display.get_full_response(), "tail\x1b[31")
+
+    def test_reset_clears_held_escape(self):
+        self.display.feed("a\x1b[31")
+        self.display.reset()
+        output = self._capture(["b"])
+        self.assertEqual(output, "b")
+
+
+class TestSplitTrailingPartialEscape(unittest.TestCase):
+    """Test the split_trailing_partial_escape helper."""
+
+    def test_no_escape(self):
+        self.assertEqual(split_trailing_partial_escape("hello"), ("hello", ""))
+
+    def test_complete_sequence_not_held(self):
+        self.assertEqual(split_trailing_partial_escape("a\x1b[31m"), ("a\x1b[31m", ""))
+
+    def test_trailing_bare_esc_held(self):
+        self.assertEqual(split_trailing_partial_escape("a\x1b"), ("a", "\x1b"))
+
+    def test_trailing_partial_csi_held(self):
+        self.assertEqual(split_trailing_partial_escape("a\x1b[1;2"), ("a", "\x1b[1;2"))
+
+    def test_trailing_partial_osc_held(self):
+        self.assertEqual(split_trailing_partial_escape("a\x1b]0;title"), ("a", "\x1b]0;title"))
+
+    def test_trailing_osc_with_st_prefix_held(self):
+        # The trailing ESC may be the first half of the ST terminator.
+        self.assertEqual(split_trailing_partial_escape("a\x1b]0;t\x1b"), ("a", "\x1b]0;t\x1b"))
 
 
 if __name__ == "__main__":
