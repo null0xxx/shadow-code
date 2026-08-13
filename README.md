@@ -429,7 +429,8 @@ Startup prints a short **authority block** naming every active authority
 boundary and every unavailable capability before the first prompt: the
 contained workspace root with its device/inode identity and containment
 mode, the granted capabilities, each withheld capability with its reason
-(`network.access` and `mcp.invoke` are never granted by this build;
+(`network.access` is never granted by this build; `mcp.invoke` is granted
+only when a configured MCP server discovered usable tools — see below;
 `process.execute` is withheld under `SHADOW_BASH_STRICT=1` without a kernel
 sandbox), the bash sandbox label, the mutation mode, the one-shot approval
 model, and the active prompt digest.
@@ -475,6 +476,65 @@ scripts/install.sh uninstall --purge  # also delete user data, behind an interac
 Uninstall never deletes `~/.local/state/shadow-code` (sessions, events,
 prompt snapshots, backups) or `~/.config/shadow-code` (prompt overlays)
 unless `--purge` is given and confirmed by typing `purge`.
+
+### MCP servers (WU-13)
+
+Shadow Code can connect to local [MCP](https://modelcontextprotocol.io)
+servers over the **stdio transport** with a hand-rolled, dependency-free
+client (newline-delimited JSON-RPC 2.0: `initialize` →
+`notifications/initialized` → `tools/list` → `tools/call`). Servers are
+configured in `~/.config/shadow-code/mcp.json` (`$XDG_CONFIG_HOME` is
+honored) — a file, never environment variables:
+
+```json
+{
+  "servers": {
+    "echo": {
+      "command": "/usr/bin/python3",
+      "args": ["/path/to/echo_server.py"],
+      "env": {"SOME_FLAG": "1"},
+      "enabled": true,
+      "connect_timeout_seconds": 10,
+      "call_timeout_seconds": 60,
+      "max_output_chars": 20000
+    }
+  }
+}
+```
+
+At startup each enabled server is spawned in its **own process group** with
+a minimal allowlisted environment (parent secrets such as API keys are
+never inherited; only the allowlist plus the explicitly configured `env`
+entries reach the server), initialized, and queried for its tools. Every
+discovered tool is sanitized — control characters stripped, descriptions
+length-capped, malformed schemas and non-scalar properties rejected with a
+visible issue — and registered under a **namespaced** name
+`mcp_<server>__<tool>`. Namespacing is structural: a discovered tool can
+never shadow a built-in name, and duplicate names are rejected.
+
+**Safety model: no server is trusted by default.** MCP tools register with
+capability `mcp.invoke` and unknown side effects, so they flow through the
+same registry → policy → approval → executor → events pipeline as built-in
+tools and **every call requires a fresh one-shot approval** bound to the
+exact action-plan digest — a read-only declaration from the server is never
+taken on faith. Timeouts (connect and per-call, configurable per server)
+kill the whole owned process group, as do cancellation and disconnect;
+oversized output is truncated with a marker instead of crashing. A server
+that fails to initialize is reported unavailable at startup and in
+`/doctor` (redacted: configured env values are never shown) and never
+blocks the session. There is **no auto-reconnect**: once a server process
+dies or times out, later calls fail closed with a typed error until the
+next session. Session exit closes every owned client and process group and
+records each server's lifecycle (`ready`/`unavailable`/`closed`) in the
+event store; MCP tool proposals, approvals, and results are the same
+versioned event payloads as built-ins and replay identically.
+
+**Limitations (first transport, one work unit):** stdio servers only; only
+flat scalar tool arguments (string/integer/number/boolean) are supported —
+tools with array/object/nested argument schemas are rejected at discovery;
+optional arguments are sent with their type's zero value when omitted.
+Removing a server from `mcp.json` (or setting `"enabled": false`) fully
+unregisters it; no built-in tool or event schema changes.
 
 ## Features
 

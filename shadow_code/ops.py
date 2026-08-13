@@ -492,6 +492,7 @@ class DoctorFacts:
     events_db_path: str | None
     legacy_db_path: str | None
     event_store: Any = None  # live EventStore when one is open
+    mcp_servers: tuple[str, ...] = ()  # pre-rendered redacted MCP status lines
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +610,9 @@ def doctor(
     capability_lines.append(f"mutations: {facts.mutation_mode}")
     capability_lines.append("approval: one-shot, digest-bound, no remembered grants")
     section("capabilities", capability_lines)
+
+    mcp_lines = list(facts.mcp_servers) if facts.mcp_servers else ["no servers configured"]
+    section("mcp servers", mcp_lines)
 
     section(
         "prompt",
