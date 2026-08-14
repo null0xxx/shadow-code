@@ -27,7 +27,14 @@ from pydantic import BaseModel
 from ..domain.approval import ActionPlan, ApprovalAuthority
 from ..domain.policy import PolicyFacts
 from ..domain.tools import Capability, ToolCall, ToolHandler, ToolResult, ToolSpec
-from ..engine import AgentEngine, EngineResult, EngineRound, ProviderRound, StreamError
+from ..engine import (
+    AgentEngine,
+    EngineBudgets,
+    EngineResult,
+    EngineRound,
+    ProviderRound,
+    StreamError,
+)
 from ..events import Event, EventStore
 from ..ollama_client import render_ollama_tool_schemas
 from ..policy.engine import PolicyEngine
@@ -56,6 +63,14 @@ from .report import ScenarioScore
 from .scoring import CallRecord, RunTrace, ScoreOutcome, score_scenario
 
 _LOCK_FILE = ".shadow-code.lock"
+
+# Wall-clock cap for one scenario run: the engine's production default is
+# 600s, but the slowest legitimate scenario observed finishes in ~39s, so a
+# live scenario whose expected event never arrives (e.g. a model that never
+# starts the cancellable long call) would otherwise burn 10 minutes looking
+# hung. A trip ends the turn as budget_exhausted/budget_time, which scoring
+# already records in the report notes.
+LIVE_SCENARIO_MAX_SECONDS = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +243,7 @@ def build_harness(
     on_round: Callable[[EngineRound], None] | None = None,
     event_store: EventStore | None = None,
     session_id: str = "",
+    budgets: EngineBudgets | None = None,
 ) -> Harness:
     """Wire the real engine for one scenario inside a disposable workspace."""
     workspace, outside = build_scenario_dirs(scenario, base)
@@ -263,6 +279,7 @@ def build_harness(
         event_session_id=session_id,
         cancel_requested=cancel_requested,
         on_round=on_round,
+        budgets=budgets,
     )
     return Harness(
         engine=engine,
@@ -510,6 +527,7 @@ def run_scenario(
             on_round=on_round,
             event_store=store,
             session_id=session_id,
+            budgets=EngineBudgets(max_seconds=LIVE_SCENARIO_MAX_SECONDS),
         )
         system, prompt_digest = compile_system_prompt(harness.registry)
         tools = render_ollama_tool_schemas(harness.registry)

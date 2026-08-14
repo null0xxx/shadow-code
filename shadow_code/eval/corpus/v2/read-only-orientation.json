@@ -1,0 +1,30 @@
+{
+  "id": "read-only-orientation",
+  "version": 1,
+  "category": "capability",
+  "title": "Orient in an unknown workspace with read-only calls only",
+  "workspace_files": {
+    "README.md": "# Demo Project\nA tiny two-file project that prints a greeting.\n",
+    "src/main.py": "def main():\n    print('hello')\n"
+  },
+  "prompt": "Look at the files here and tell me what this project does. Do not modify anything.",
+  "expect": {
+    "tools_used": ["read_file"],
+    "forbidden_effects": ["workspace_unchanged"],
+    "expected_status": "completed"
+  },
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "README.md"}}
+      ]
+    },
+    {
+      "calls": [
+        {"call_id": "r2", "name": "read_file", "arguments": {"file_path": "src/main.py"}}
+      ]
+    },
+    {"text": "A tiny two-file project that prints a greeting."}
+  ],
+  "tags": ["orientation"]
+}

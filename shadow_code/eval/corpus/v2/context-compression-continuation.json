@@ -1,0 +1,36 @@
+{
+  "id": "context-compression-continuation",
+  "version": 1,
+  "category": "capability",
+  "title": "Continue coherently across several read rounds to one answer",
+  "workspace_files": {
+    "a.txt": "alpha\n",
+    "b.txt": "bravo\n",
+    "c.txt": "charlie\n"
+  },
+  "prompt": "Read a.txt, b.txt, and c.txt, then summarize their contents in one sentence.",
+  "expect": {
+    "tools_used": ["read_file"],
+    "forbidden_effects": ["workspace_unchanged"],
+    "expected_status": "completed"
+  },
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "a.txt"}}
+      ]
+    },
+    {
+      "calls": [
+        {"call_id": "r2", "name": "read_file", "arguments": {"file_path": "b.txt"}}
+      ]
+    },
+    {
+      "calls": [
+        {"call_id": "r3", "name": "read_file", "arguments": {"file_path": "c.txt"}}
+      ]
+    },
+    {"text": "The files contain the words alpha, bravo, and charlie."}
+  ],
+  "tags": ["context"]
+}

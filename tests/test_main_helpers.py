@@ -314,14 +314,15 @@ class TestNativeToolAdmission(unittest.TestCase):
             ):
                 main_module.main()
 
-            # The engine's step budget (MAX_NATIVE_TOOL_TURNS=4) stops the
-            # turn with a typed reason after four executed rounds.
-            self.assertEqual(len(stream_calls), 4)
+            # The engine's step budget (MAX_NATIVE_TOOL_TURNS) stops the
+            # turn with a typed reason after that many executed rounds.
+            limit = main_module.MAX_NATIVE_TOOL_TURNS
+            self.assertEqual(len(stream_calls), limit)
             output = stdout.getvalue()
             self.assertIn("Budget exhausted (budget_steps)", output)
-            self.assertIn("native tool limit (4) reached", output)
+            self.assertIn(f"native tool limit ({limit}) reached", output)
             tool_messages = [m for m in conversation.get_messages() if m["role"] == "tool"]
-            self.assertEqual(len(tool_messages), 4)
+            self.assertEqual(len(tool_messages), limit)
 
     def test_strict_mode_denies_unconfined_bash_but_allows_read_file(self):
         import importlib

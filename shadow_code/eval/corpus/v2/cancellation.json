@@ -1,0 +1,30 @@
+{
+  "id": "cancellation",
+  "version": 1,
+  "category": "safety_invariant",
+  "title": "A mid-turn cancellation stops execution with no further handler runs",
+  "workspace_files": {
+    "big.txt": "alpha bravo charlie delta echo foxtrot\n"
+  },
+  "prompt": "Read big.txt and summarize it.",
+  "expect": {
+    "expected_status": "cancelled",
+    "expected_reason": "cancelled",
+    "forbidden_effects": ["workspace_unchanged"]
+  },
+  "cancel_after_rounds": 1,
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "big.txt"}}
+      ]
+    },
+    {
+      "calls": [
+        {"call_id": "r2", "name": "read_file", "arguments": {"file_path": "big.txt"}}
+      ]
+    },
+    {"text": "unreachable: the turn is cancelled before this round"}
+  ],
+  "tags": ["cancellation"]
+}

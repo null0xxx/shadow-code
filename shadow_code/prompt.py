@@ -171,6 +171,7 @@ Backup a file before risky edits, restore if something breaks.
 - Verify your work: run the test, execute the script, check the output.
 - Finish the whole task: keep calling tools until every file and step is done; never describe remaining work instead of doing it.
 - Never write tool calls as text or in code fences; only native tool calls execute.
+- Example: "build a page with html, css, js" -> write_file index.html (linking style.css and script.js), write_file style.css, write_file script.js: three separate files, one write each, no <style>/<script> inlining.
 
 # Safety
 

@@ -1,0 +1,26 @@
+{
+  "id": "focused-test",
+  "version": 1,
+  "category": "capability",
+  "title": "Run one focused test and report its outcome",
+  "workspace_files": {
+    "calc.py": "def add(a, b):\n    return a + b\n",
+    "test_calc.py": "from calc import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n\n\nif __name__ == '__main__':\n    test_add()\n    print('PASS')\n"
+  },
+  "prompt": "Run the focused test in test_calc.py and tell me whether it passes.",
+  "expect": {
+    "tools_used": ["bash"],
+    "paths_touched": ["test_calc.py"],
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "b1", "name": "bash", "arguments": {"command": "python3 test_calc.py"}}
+      ]
+    },
+    {"text": "The focused test passes."}
+  ],
+  "tags": ["test"]
+}
