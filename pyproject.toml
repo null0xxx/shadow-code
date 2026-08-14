@@ -19,6 +19,19 @@ dev = [
 [project.scripts]
 shadow-code = "shadow_code.main:main"
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Explicit discovery: stray directories (e.g. gitignored eval/reports/) must
+# never break flat-layout auto-discovery, and the eval corpus JSONs are data
+# loaded via Path(__file__).parent — they must ship inside the wheel.
+[tool.setuptools.packages.find]
+include = ["shadow_code*"]
+
+[tool.setuptools.package-data]
+"shadow_code.eval" = ["corpus/v1/*.json"]
+
 # -- Tool Configuration --
 
 [tool.pytest.ini_options]
