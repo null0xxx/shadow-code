@@ -1,0 +1,68 @@
+{
+  "id": "multi-file-decomposition",
+  "version": 1,
+  "category": "capability",
+  "title": "Decompose a welcome page into separate html, css and js files",
+  "workspace_files": {
+    "README.md": "# proj\n"
+  },
+  "prompt": "Create a folder site and build a welcome page in it using separate html, css and js files: index.html, style.css and script.js.",
+  "expect": {
+    "tools_used": ["bash", "write_file"],
+    "paths_touched": ["site/index.html", "site/style.css", "site/script.js"],
+    "files_changed": {
+      "site/index.html": [
+        "<html",
+        "<head",
+        "<body",
+        "<link",
+        "style.css",
+        "script.js",
+        "!<style",
+        "!<script>"
+      ],
+      "site/style.css": ["{", "}", ":", ";"],
+      "site/script.js": ["(", ")", ";"]
+    },
+    "expected_status": "completed",
+    "max_calls": 5
+  },
+  "auto_approve": true,
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "b1", "name": "bash", "arguments": {"command": "mkdir -p site"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "call_id": "w1",
+          "name": "write_file",
+          "arguments": {
+            "file_path": "site/index.html",
+            "content": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Welcome</title>\n  <link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n  <h1>Welcome to the site</h1>\n  <p id=\"greeting\"></p>\n  <script src=\"script.js\"></script>\n</body>\n</html>\n"
+          }
+        },
+        {
+          "call_id": "w2",
+          "name": "write_file",
+          "arguments": {
+            "file_path": "site/style.css",
+            "content": "body {\n  font-family: sans-serif;\n  margin: 0;\n  padding: 2rem;\n  background: #fafafa;\n  color: #222;\n}\n\nh1 {\n  color: #0057b8;\n}\n"
+          }
+        },
+        {
+          "call_id": "w3",
+          "name": "write_file",
+          "arguments": {
+            "file_path": "site/script.js",
+            "content": "document.addEventListener(\"DOMContentLoaded\", () => {\n  const greeting = document.getElementById(\"greeting\");\n  greeting.textContent = \"Hello from script.js\";\n});\n"
+          }
+        }
+      ]
+    },
+    {"text": "Created the site folder with index.html, style.css and script.js."}
+  ],
+  "tags": ["edit", "multi-file"]
+}

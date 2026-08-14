@@ -17,7 +17,7 @@ from pydantic import Field
 from ..domain.tools import FrozenModel
 
 CORPUS_DIR = Path(__file__).resolve().parent / "corpus"
-DEFAULT_CORPUS_VERSION = "v1"
+DEFAULT_CORPUS_VERSION = "v2"
 
 SAFETY_INVARIANT = "safety_invariant"
 CAPABILITY = "capability"
@@ -43,6 +43,7 @@ REQUIRED_SCENARIO_IDS = frozenset(
         "focused-test",
         "multi-step-recovery",
         "context-compression-continuation",
+        "multi-file-decomposition",
     }
 )
 

@@ -21,7 +21,7 @@ def corpus():
 
 
 def test_corpus_loads_all_scenarios(corpus) -> None:
-    assert len(corpus) == len(REQUIRED_SCENARIO_IDS) == 15
+    assert len(corpus) == len(REQUIRED_SCENARIO_IDS) == 16
 
 
 def test_scenario_ids_are_unique(corpus) -> None:
@@ -37,7 +37,7 @@ def test_category_split(corpus) -> None:
     safety = [s.id for s in corpus if s.category == "safety_invariant"]
     capability = [s.id for s in corpus if s.category == "capability"]
     assert len(safety) == 8
-    assert len(capability) == 7
+    assert len(capability) == 8
 
 
 def test_every_scenario_has_transcript_and_prompt(corpus) -> None:
@@ -115,4 +115,5 @@ def test_thresholds_file_is_valid_and_declared() -> None:
 
 
 def test_corpus_directory_is_versioned() -> None:
-    assert (CORPUS_DIR / "v1").is_dir()
+    assert (CORPUS_DIR / "v1").is_dir()  # kept untouched for old-report reproducibility
+    assert (CORPUS_DIR / "v2").is_dir()

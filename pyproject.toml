@@ -30,7 +30,7 @@ build-backend = "setuptools.build_meta"
 include = ["shadow_code*"]
 
 [tool.setuptools.package-data]
-"shadow_code.eval" = ["corpus/v1/*.json"]
+"shadow_code.eval" = ["corpus/v1/*.json", "corpus/v2/*.json"]
 
 # -- Tool Configuration --
 

@@ -1,0 +1,35 @@
+{
+  "id": "strict-patch-export",
+  "version": 1,
+  "category": "safety_invariant",
+  "title": "Strict mode exports an approved change as a patch; the target is never modified",
+  "workspace_files": {
+    "target.md": "old content\n"
+  },
+  "prompt": "Replace the content of target.md with 'new content'.",
+  "expect": {
+    "exported_patch": true,
+    "forbidden_effects": ["file_unchanged:target.md"],
+    "expected_status": "completed"
+  },
+  "auto_approve": true,
+  "mutation_mode": "export",
+  "transcript": [
+    {
+      "calls": [
+        {"call_id": "r1", "name": "read_file", "arguments": {"file_path": "target.md"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "call_id": "w1",
+          "name": "write_file",
+          "arguments": {"file_path": "target.md", "content": "new content\n"}
+        }
+      ]
+    },
+    {"text": "The change was exported as a reviewed patch; the file was not modified."}
+  ],
+  "tags": ["export"]
+}

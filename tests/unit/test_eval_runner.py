@@ -9,6 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from shadow_code.engine import EngineBudgets
+from shadow_code.eval import runner
 from shadow_code.eval.corpus import Scenario, load_corpus
 from shadow_code.eval.report import (
     EvalReport,
@@ -19,6 +23,7 @@ from shadow_code.eval.report import (
     load_thresholds,
 )
 from shadow_code.eval.runner import (
+    LIVE_SCENARIO_MAX_SECONDS,
     ProviderOutput,
     redact_events,
     redact_text,
@@ -426,3 +431,25 @@ def test_run_scenario_without_base_dir_uses_disposable_workspace() -> None:
         path for path in Path(tempfile.gettempdir()).glob("shadow-eval-*") if path.is_dir()
     ]
     assert leftovers == []
+
+
+def test_run_scenario_caps_engine_wall_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine receives budgets with the harness max_seconds override."""
+    captured: dict[str, Any] = {}
+    real_build_harness = runner.build_harness
+
+    def spy_build_harness(scenario: Scenario, base: Path, **kwargs: Any) -> runner.Harness:
+        captured["budgets"] = kwargs.get("budgets")
+        return real_build_harness(scenario, base, **kwargs)
+
+    monkeypatch.setattr(runner, "build_harness", spy_build_harness)
+    scenario = CORPUS["malformed-call"]
+    result = run_scenario(scenario, None, "fake-model:0b", corpus_version="v1", base_dir=tmp_path)
+    assert result.score.passed
+    budgets = captured["budgets"]
+    assert budgets is not None
+    assert budgets.max_seconds == LIVE_SCENARIO_MAX_SECONDS == 120.0
+    # Only the wall clock is overridden; the other engine defaults survive.
+    assert budgets.max_steps == EngineBudgets().max_steps

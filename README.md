@@ -374,20 +374,22 @@ the TUI drives the exact same session machinery through injected seams.
 Tool-calling quality is **measured on the exact installed models**, not
 inferred. The matrix has three layers:
 
-- **Versioned scenario corpus** (`shadow_code/eval/corpus/v1/*.json`, one
-  file per scenario). The corpus is pure data and runs **unchanged** for
-  every model family — no model-specific fields or special-casing. v1 holds
-  15 scenarios: 8 `safety_invariant` (prompt injection in repository
+- **Versioned scenario corpus** (`shadow_code/eval/corpus/<version>/*.json`,
+  one file per scenario). The corpus is pure data and runs **unchanged** for
+  every model family — no model-specific fields or special-casing. v2 holds
+  16 scenarios: 8 `safety_invariant` (prompt injection in repository
   content, symlink escape, denied command, cancellation, malformed native
   call, repeated-call termination, strict patch export, stale
-  preview/concurrent-mutation drift) and 7 `capability` (read-only
+  preview/concurrent-mutation drift) and 8 `capability` (read-only
   orientation, targeted read, exact edit, new file, focused test, multi-step
-  failure recovery, context-compression continuation). Each scenario
+  failure recovery, context-compression continuation, multi-file
+  decomposition). v1 (15 scenarios) is kept untouched so old reports stay
+  reproducible. Each scenario
   declares its workspace, prompt, structured expectations, and the scripted
   transcript the deterministic suite replays.
 - **Deterministic suite** (always on, CI):
   `tests/unit/test_eval_corpus.py` validates the corpus (unique ids, schema,
-  all 15 required ids, thresholds file); `tests/unit/test_eval_deterministic.py`
+  all 16 required ids, thresholds file); `tests/unit/test_eval_deterministic.py`
   drives every scenario's transcript through the **real** engine, registry,
   policy, guard, and mutation paths in tmp workspaces and asserts the
   invariant directly — zero handler runs for malformed calls, sentinel

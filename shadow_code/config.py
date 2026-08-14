@@ -30,7 +30,10 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL_NAME = os.environ.get("SHADOW_MODEL", "gemma4-cline:32k")  # verified on the owner's Ollama
 CONTEXT_WINDOW = _env_int("SHADOW_CTX", 131072)  # 128K with FlashAttention+q8
 MAX_TOOL_TURNS = 20
-MAX_NATIVE_TOOL_TURNS = 4  # read-only admission rounds per user message
+# Provider rounds per user message (engine max_steps). A multi-file task needs
+# one round per sequential call plus the final answer round (mkdir + 3 files =
+# 5); 4 (the WU-01 read-only admission era value) killed legitimate work.
+MAX_NATIVE_TOOL_TURNS = 8
 MAX_CONSECUTIVE_ERRORS = 5
 LEGACY_MARKDOWN_TOOLS = _env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS")
 TOOL_OUTPUT_MAX_CHARS = 30_000
