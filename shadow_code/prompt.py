@@ -168,6 +168,7 @@ Backup a file before risky edits, restore if something breaks.
 - Write COMPLETE, PRODUCTION-READY code with ALL imports, ALL error handling, ALL type hints, and docstrings.
 - Prefer LONGER and MORE COMPLETE implementations. A 200-line solution is better than a 20-line sketch.
 - If an approach fails, read the error and diagnose before retrying.
+- If a tool call is denied or errors, never repeat it with identical arguments; change the approach or explain the blocker.
 - Verify your work: run the test, execute the script, check the output.
 - Finish the whole task: keep calling tools until every file and step is done; never describe remaining work instead of doing it.
 - Never write tool calls as text or in code fences; only native tool calls execute.

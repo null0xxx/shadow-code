@@ -517,7 +517,10 @@ class AgentEngine:
                 tool_name=validated.call.name,
                 error=ToolError(
                     code="policy_denied",
-                    message=f"Policy denied execution ({decision.reason.value}).",
+                    message=(
+                        f"Policy denied execution ({decision.reason.value})."
+                        " Do not retry this call; respond to the user instead."
+                    ),
                 ),
             )
             self._emit(
@@ -596,7 +599,10 @@ class AgentEngine:
                 tool_name=validated.call.name,
                 error=ToolError(
                     code="approval_denied",
-                    message="User denied or cancelled the approval; the call was not executed.",
+                    message=(
+                        "User denied or cancelled the approval; the call was not executed."
+                        " Do not retry this call; respond to the user instead."
+                    ),
                 ),
             )
             self._emit(

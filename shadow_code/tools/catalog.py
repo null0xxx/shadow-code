@@ -337,6 +337,9 @@ def _mutation_export_output(plan: MutationPlan, patch_path: str) -> str:
             f"planned sha256: {plan.new_sha256}",
             f"planned bytes: {plan.new_size}",
             "note: the workspace was NOT modified; review and apply the patch manually",
+            "next: the requested change is complete as an exported patch; do not retry this write",
+            "verify: a follow-up read still shows the OLD content in export mode;"
+            " that is expected, not a failure",
         ]
     )
 
