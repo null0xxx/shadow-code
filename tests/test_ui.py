@@ -33,8 +33,56 @@ class TestUIRenderer(unittest.TestCase):
         self.ui = UIRenderer()
 
     def test_render_welcome(self):
+        from rich.console import Group
+
         result = self.ui.render_welcome()
-        self.assertIsNotNone(result)
+        self.assertIsInstance(result, Group)
+
+    def test_render_welcome_contains_banner_tips_and_tagline(self):
+        out = _render_to_str(self.ui.render_welcome(100))
+        self.assertIn("####", out)  # wordmark art
+        self.assertIn("Tips for getting started:", out)
+        self.assertIn("/help", out)
+
+    def test_render_welcome_gradient_when_color_enabled(self):
+        import os
+        from unittest.mock import patch
+
+        from rich.console import Console
+
+        # The runner env may pin NO_COLOR/TERM=dumb; force a truecolor
+        # terminal so the gradient assertion is runner-independent.
+        with patch.dict(os.environ, {"TERM": "xterm-256color", "COLORTERM": "truecolor"}):
+            os.environ.pop("NO_COLOR", None)
+            buf = io.StringIO()
+            console = Console(file=buf, force_terminal=True, width=100)
+            self.assertFalse(console.no_color)
+            console.print(self.ui.render_welcome(100))
+        out = buf.getvalue()
+        self.assertIn("\x1b[38;2;", out)  # truecolor gradient escapes
+        self.assertIn("175;135;215", out)  # theme accent at the left edge
+
+    def test_render_welcome_no_color_env_emits_no_ansi(self):
+        import os
+        from unittest.mock import patch
+
+        from rich.console import Console
+
+        # Pin TERM=dumb so the zero-ANSI assertion is runner-independent
+        # (same gotcha as test_render_response_no_color_env_emits_no_ansi).
+        with patch.dict(os.environ, {"NO_COLOR": "1", "TERM": "dumb"}):
+            buf = io.StringIO()
+            console = Console(file=buf, force_terminal=True, width=100)
+            console.print(self.ui.render_welcome(100))
+        out = buf.getvalue()
+        self.assertNotIn("\x1b", out)
+        self.assertIn("####", out)  # plain ASCII art survives
+        self.assertIn("Tips for getting started:", out)
+
+    def test_render_welcome_narrow_terminal_falls_back(self):
+        out = _render_to_str(self.ui.render_welcome(20), width=40)
+        self.assertIn("SHADOW CODE", out)
+        self.assertNotIn("####", out)
 
     def test_render_thinking(self):
         result = self.ui.render_thinking()
@@ -55,7 +103,8 @@ class TestUIRenderer(unittest.TestCase):
         result = self.ui.render_response("Some response", tokens=100)
         self.assertIsInstance(result, Group)
         renderables = list(result.renderables)
-        self.assertIsInstance(renderables[0], Markdown)
+        self.assertIsInstance(renderables[0], Text)  # ⏺ accent marker
+        self.assertIsInstance(renderables[1], Markdown)
         self.assertIsInstance(renderables[-1], Text)
 
     def test_render_response_no_tokens(self):
@@ -65,8 +114,14 @@ class TestUIRenderer(unittest.TestCase):
         result = self.ui.render_response("Response")
         self.assertIsInstance(result, Group)
         renderables = list(result.renderables)
-        self.assertEqual(len(renderables), 1)
-        self.assertIsInstance(renderables[0], Markdown)
+        self.assertEqual(len(renderables), 2)
+        self.assertIsInstance(renderables[0], Text)
+        self.assertIsInstance(renderables[1], Markdown)
+
+    def test_render_response_marker_present(self):
+        out = _render_to_str(self.ui.render_response("answer"))
+        self.assertIn("⏺", out)
+        self.assertIn("answer", out)
 
     def test_render_streaming_with_thinking_separates_and_sanitizes(self):
         from rich.console import Group
@@ -162,6 +217,31 @@ class TestUIRenderer(unittest.TestCase):
     def test_render_response_token_line_present(self):
         out = _render_to_str(self.ui.render_response("answer", tokens=1234))
         self.assertIn("1,234 tokens", out)
+
+    def test_loose_markdown_numbered_run_becomes_list(self):
+        out = _render_to_str(self.ui.render_response("1 first\n2 second\n3 third"))
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        # Recognized as a list: each item on its own line, no run-on merge.
+        self.assertTrue(any("first" in ln for ln in lines))
+        self.assertTrue(any("second" in ln for ln in lines))
+        self.assertFalse(any("first" in ln and "second" in ln for ln in lines))
+
+    def test_loose_markdown_bullet_marker(self):
+        out = _render_to_str(self.ui.render_response("• alpha\n• beta"))
+        self.assertIn("alpha", out)
+        self.assertIn("beta", out)
+
+    def test_loose_markdown_year_is_not_a_list(self):
+        norm = self.ui._normalize_loose_markdown("2026 წლის გეგმა")
+        self.assertEqual(norm, "2026 წლის გეგმა")
+
+    def test_loose_markdown_non_run_numbers_untouched(self):
+        norm = self.ui._normalize_loose_markdown("3 პუნქტი მხოლოდ")
+        self.assertEqual(norm, "3 პუნქტი მხოლოდ")
+
+    def test_loose_markdown_fence_content_untouched(self):
+        raw = "```python\n1 not a list\n• safe\n```"
+        self.assertEqual(self.ui._normalize_loose_markdown(raw), raw)
 
     def test_render_tool_call(self):
         result = self.ui.render_tool_call("bash", "ls -la")

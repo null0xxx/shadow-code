@@ -15,6 +15,7 @@ import difflib
 import os
 import platform
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -718,7 +719,7 @@ def _dispatch_slash_command(
         rt.first_message = True
         if rt.console is not None and rt.ui is not None:
             rt.console.clear()
-            rt.console.print(rt.ui.render_welcome())
+            rt.console.print(rt.ui.render_welcome(rt.console.width))
         return _DISPATCH_CLEAR
 
     ctx = rt.ctx
@@ -1461,12 +1462,17 @@ def main(tui_input: Any = None, tui_output: Any = None) -> None:
         ui = UIRenderer()
         display = StreamDisplay()
         stream_ctrl = StreamController(client, ui, console, display)
-        console.print(ui.render_welcome())
+        console.print(ui.render_welcome(console.width))
     else:
         console = None
         ui = None
         display = StreamDisplay()
         stream_ctrl = None
+        from . import banner
+
+        columns = shutil.get_terminal_size().columns
+        for line in [*banner.banner_lines(columns), "", *banner.tips_lines()]:
+            print(line)
         print(f"shadow-code v0.1.0 | {MODEL_NAME}")
         print(f"CWD: {cwd}")
 
