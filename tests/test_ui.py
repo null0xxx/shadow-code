@@ -163,6 +163,31 @@ class TestUIRenderer(unittest.TestCase):
         out = _render_to_str(self.ui.render_response("answer", tokens=1234))
         self.assertIn("1,234 tokens", out)
 
+    def test_loose_markdown_numbered_run_becomes_list(self):
+        out = _render_to_str(self.ui.render_response("1 first\n2 second\n3 third"))
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        # Recognized as a list: each item on its own line, no run-on merge.
+        self.assertTrue(any("first" in ln for ln in lines))
+        self.assertTrue(any("second" in ln for ln in lines))
+        self.assertFalse(any("first" in ln and "second" in ln for ln in lines))
+
+    def test_loose_markdown_bullet_marker(self):
+        out = _render_to_str(self.ui.render_response("• alpha\n• beta"))
+        self.assertIn("alpha", out)
+        self.assertIn("beta", out)
+
+    def test_loose_markdown_year_is_not_a_list(self):
+        norm = self.ui._normalize_loose_markdown("2026 წლის გეგმა")
+        self.assertEqual(norm, "2026 წლის გეგმა")
+
+    def test_loose_markdown_non_run_numbers_untouched(self):
+        norm = self.ui._normalize_loose_markdown("3 პუნქტი მხოლოდ")
+        self.assertEqual(norm, "3 პუნქტი მხოლოდ")
+
+    def test_loose_markdown_fence_content_untouched(self):
+        raw = "```python\n1 not a list\n• safe\n```"
+        self.assertEqual(self.ui._normalize_loose_markdown(raw), raw)
+
     def test_render_tool_call(self):
         result = self.ui.render_tool_call("bash", "ls -la")
         self.assertIsInstance(result, Text)
