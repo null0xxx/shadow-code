@@ -285,7 +285,11 @@ class TranscriptModel:
         if entry.group is not None:
             return render_tool_group(entry.group, theme, width)
         if entry.kind == _KIND_BANNER:
-            return [*_banner.banner_lines(width), "", *_banner.tips_lines()]
+            return [
+                *_banner.banner_lines(width, ascii_mode=theme.ascii_mode),
+                "",
+                *_banner.tips_lines(),
+            ]
         if entry.kind == _KIND_USER:
             return _boxed_lines(entry.text, theme, width)
         prefix = _prefix(entry.kind, theme)
@@ -318,7 +322,9 @@ class TranscriptModel:
                 fragments.extend(render_tool_group_fragments(entry.group, theme, width))
                 continue
             if entry.kind == _KIND_BANNER:
-                fragments.extend(_banner.styled_banner_fragments(theme.colors, width))
+                fragments.extend(
+                    _banner.styled_banner_fragments(theme.colors, width, theme.ascii_mode)
+                )
                 fragments.append(("", "\n\n"))
                 fragments.extend(_banner.styled_tips_fragments(theme.colors))
                 continue

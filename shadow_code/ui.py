@@ -53,6 +53,8 @@ class UIRenderer:
             for column, char in enumerate(line):
                 if char == " ":
                     art.append(char)
+                elif char == banner.SHADOW_CHAR:
+                    art.append(char, style=_t.text_muted)
                 else:
                     art.append(char, style=banner.column_color(column))
 

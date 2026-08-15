@@ -39,8 +39,16 @@ class TestUIRenderer(unittest.TestCase):
         self.assertIsInstance(result, Group)
 
     def test_render_welcome_contains_banner_tips_and_tagline(self):
-        out = _render_to_str(self.ui.render_welcome(100))
-        self.assertIn("####", out)  # wordmark art
+        import os
+        from unittest.mock import patch
+
+        # Pin a unicode, color-capable env so the block art is selected
+        # regardless of the runner's NO_COLOR/SHADOW_ASCII pins.
+        with patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            os.environ.pop("SHADOW_ASCII", None)
+            out = _render_to_str(self.ui.render_welcome(100))
+        self.assertIn("██", out)  # block wordmark art
         self.assertIn("Tips for getting started:", out)
         self.assertIn("/help", out)
 

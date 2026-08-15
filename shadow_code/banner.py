@@ -1,15 +1,21 @@
 # shadow_code/banner.py -- Startup wordmark and tips block
 #
-# Pure, headless-testable projection of the visual identity: a block-letter
-# "SHADOW CODE" ASCII wordmark, a left-to-right color gradient across the
-# theme palette (accent -> info -> highlight), and the getting-started tips.
-# No rendering library is imported here: the Rich REPL and the prompt_toolkit
-# TUI each map these primitives onto their own style model, so NO_COLOR and
-# ASCII modes degrade to the same plain text everywhere.
+# Pure, headless-testable projection of the visual identity: a full-block
+# (U+2588) "SHADOW CODE" wordmark with a dim drop-shadow row, a left-to-right
+# color gradient across the theme palette (accent -> info -> highlight), and
+# the getting-started tips. ASCII mode (SHADOW_ASCII / NO_COLOR / non-UTF-8)
+# falls back to the original #-art. No rendering library is imported here:
+# the Rich REPL and the prompt_toolkit TUI each map these primitives onto
+# their own style model.
 
-from .theme import THEME
+import os
+
+from .theme import THEME, _supports_unicode
 
 # -- wordmark -----------------------------------------------------------------
+
+FULL_BLOCK = "█"  # ink
+SHADOW_CHAR = "░"  # drop-shadow row, styled text_muted at render time
 
 # 5x5 block letters, one row per string, pure ASCII so every terminal mode
 # (including SHADOW_ASCII) renders the same art.
@@ -43,7 +49,100 @@ def _render_word(word: str) -> tuple[str, ...]:
 
 
 BANNER_ART: tuple[str, ...] = _render_word(_WORD)
-BANNER_WIDTH: int = max(len(line) for line in BANNER_ART)
+BANNER_ASCII_WIDTH: int = max(len(line) for line in BANNER_ART)
+
+# 6-row full-block letters, the primary wordmark. W runs wider (8 cols) so
+# its middle stroke stays legible; everything else is 6 cols.
+_BLOCK_FONT: dict[str, tuple[str, ...]] = {
+    "S": (
+        "██████",
+        "██    ",
+        "██████",
+        "    ██",
+        "    ██",
+        "██████",
+    ),
+    "H": (
+        "██  ██",
+        "██  ██",
+        "██████",
+        "██  ██",
+        "██  ██",
+        "██  ██",
+    ),
+    "A": (
+        " ████ ",
+        "██  ██",
+        "██  ██",
+        "██████",
+        "██  ██",
+        "██  ██",
+    ),
+    "D": (
+        "█████ ",
+        "██  ██",
+        "██  ██",
+        "██  ██",
+        "██  ██",
+        "█████ ",
+    ),
+    "O": (
+        " ████ ",
+        "██  ██",
+        "██  ██",
+        "██  ██",
+        "██  ██",
+        " ████ ",
+    ),
+    "W": (
+        "██    ██",
+        "██    ██",
+        "██ ██ ██",
+        "████ ████",
+        " ██  ██ ",
+        " ██  ██ ",
+    ),
+    "C": (
+        " █████",
+        "██    ",
+        "██    ",
+        "██    ",
+        "██    ",
+        " █████",
+    ),
+    "E": (
+        "██████",
+        "██    ",
+        "█████ ",
+        "██    ",
+        "██    ",
+        "██████",
+    ),
+}
+
+
+def _render_block_word(word: str) -> tuple[str, ...]:
+    """Assemble the block wordmark; the space between words is 3 columns."""
+    rows: list[str] = []
+    for row_index in range(6):
+        parts = []
+        for char in word:
+            if char == " ":
+                parts.append("  ")
+            else:
+                parts.append(_BLOCK_FONT[char][row_index])
+        rows.append(" ".join(parts).rstrip())
+    return tuple(rows)
+
+
+_BLOCK_CORE: tuple[str, ...] = _render_block_word(_WORD)
+
+# Extruded look: one shadow row beneath the letters -- the bottom row's
+# silhouette shifted one column right, drawn in light shade and styled dim.
+_SHADOW_ROW = " " + _BLOCK_CORE[-1].replace(FULL_BLOCK, SHADOW_CHAR)
+
+BLOCK_ART: tuple[str, ...] = (*_BLOCK_CORE, _SHADOW_ROW)
+BANNER_WIDTH: int = max(len(line) for line in BLOCK_ART)
 
 TAGLINE = "Local-first agentic coding with explicit authority boundaries"
 
@@ -54,11 +153,28 @@ TIPS: tuple[str, ...] = (
 )
 
 
-def banner_lines(width: int | None = None) -> list[str]:
-    """Wordmark lines; a terminal narrower than the art gets a plain title."""
-    if width is not None and width < BANNER_WIDTH:
+def _ascii_default() -> bool:
+    """ASCII fallback: explicit opt-out, NO_COLOR, or a non-UTF-8 terminal."""
+    if os.environ.get("SHADOW_ASCII", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if "NO_COLOR" in os.environ:
+        return True
+    return not _supports_unicode()
+
+
+def banner_lines(width: int | None = None, ascii_mode: bool | None = None) -> list[str]:
+    """Wordmark lines; a terminal narrower than the art gets a plain title.
+
+    Block art is the default; ASCII mode (or auto-detected NO_COLOR /
+    SHADOW_ASCII / non-unicode terminals) keeps the original #-art.
+    """
+    if ascii_mode is None:
+        ascii_mode = _ascii_default()
+    art = BANNER_ART if ascii_mode else BLOCK_ART
+    art_width = BANNER_ASCII_WIDTH if ascii_mode else BANNER_WIDTH
+    if width is not None and width < art_width:
         return [_NARROW_TITLE]
-    return list(BANNER_ART)
+    return list(art)
 
 
 def tips_lines() -> list[str]:
@@ -99,19 +215,24 @@ def column_color(index: int) -> str:
 # -- prompt_toolkit fragments -----------------------------------------------------
 
 
-def styled_banner_fragments(colors: bool, width: int | None = None) -> list[tuple[str, str]]:
+def styled_banner_fragments(
+    colors: bool, width: int | None = None, ascii_mode: bool | None = None
+) -> list[tuple[str, str]]:
     """(style, text) fragments for the wordmark; gradient only with colors.
 
     Space characters carry no style, so a terminal background always shows
-    through the letter gaps; without colors the art passes through plain.
+    through the letter gaps; the shadow row is styled text_muted; without
+    colors the art passes through plain.
     """
     fragments: list[tuple[str, str]] = []
-    for line_index, line in enumerate(banner_lines(width)):
+    for line_index, line in enumerate(banner_lines(width, ascii_mode)):
         if line_index:
             fragments.append(("", "\n"))
         for column, char in enumerate(line):
             if char == " " or not colors:
                 fragments.append(("", char))
+            elif char == SHADOW_CHAR:
+                fragments.append((THEME.text_muted, char))
             else:
                 fragments.append((column_color(column), char))
     return fragments
