@@ -134,6 +134,28 @@ class TestLegacyMarkdownToolBoundary(unittest.TestCase):
         with patch.dict(os.environ, {"SHADOW_LEGACY_MARKDOWN_TOOLS": "true"}, clear=True):
             self.assertTrue(_env_flag("SHADOW_LEGACY_MARKDOWN_TOOLS"))
 
+    def test_think_flag_parsing(self):
+        from shadow_code.config import _env_flag
+
+        cases = [
+            ({}, False),  # default: off
+            ({"SHADOW_THINK": "0"}, False),
+            ({"SHADOW_THINK": "1"}, True),
+            ({"SHADOW_THINK": "true"}, True),
+            ({"SHADOW_THINK": "garbage"}, False),
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(_env_flag("SHADOW_THINK"), expected)
+
+    def test_think_flag_module_default_is_off(self):
+        import shadow_code.config as config
+
+        # The test environment never sets SHADOW_THINK, so the module
+        # constant must reflect the default.
+        self.assertNotIn("SHADOW_THINK", os.environ)
+        self.assertFalse(config.THINK_ENABLED)
+
     def test_disabled_tool_only_fence_returns_typed_protocol_mismatch(self):
         from shadow_code.domain.tools import ToolError
         from shadow_code.main import _legacy_markdown_protocol_error
@@ -1112,6 +1134,80 @@ class TestOllamaClient(unittest.TestCase):
 
         self.assertNotIn("tools", post.call_args.kwargs["json"])
         self.assertEqual(client.last_tool_calls, [])
+
+    def test_chat_stream_routes_thinking_to_handler_never_text(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        client = OllamaClient()
+        mock_resp = MagicMock()
+        mock_resp.iter_lines.return_value = [
+            json.dumps(
+                {"message": {"thinking": "reasoning ", "content": ""}, "done": False}
+            ).encode(),
+            json.dumps(
+                {"message": {"thinking": "more", "content": "answer"}, "done": False}
+            ).encode(),
+            json.dumps(
+                {
+                    "message": {"content": ""},
+                    "done": True,
+                    "prompt_eval_count": 10,
+                    "eval_count": 7,
+                }
+            ).encode(),
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        seen: list[str] = []
+        client.thinking_handler = seen.append
+        with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp):
+            chunks = list(client.chat_stream([], "system"))
+
+        # Thinking text surfaces only through the display-only handler...
+        self.assertEqual(seen, ["reasoning ", "more"])
+        # ...never as response chunks or stored client state.
+        self.assertEqual(chunks, ["answer"])
+        self.assertEqual(client.last_tool_calls, [])
+        self.assertEqual(client.last_eval_tokens, 7)
+
+    def test_chat_stream_without_thinking_field_leaves_handler_untouched(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        client = OllamaClient()
+        mock_resp = MagicMock()
+        mock_resp.iter_lines.return_value = [
+            json.dumps({"message": {"content": "hi"}, "done": True}).encode()
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        handler = MagicMock()
+        client.thinking_handler = handler
+        with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp):
+            self.assertEqual(list(client.chat_stream([], "system")), ["hi"])
+
+        handler.assert_not_called()
+
+    def test_chat_stream_sends_think_param_only_when_enabled(self):
+        import json
+
+        from shadow_code.ollama_client import OllamaClient
+
+        def payload_for(enabled: bool) -> dict:
+            with patch("shadow_code.ollama_client.THINK_ENABLED", enabled):
+                client = OllamaClient()
+            mock_resp = MagicMock()
+            mock_resp.iter_lines.return_value = [
+                json.dumps({"message": {"content": "hi"}, "done": True}).encode()
+            ]
+            mock_resp.raise_for_status = MagicMock()
+            with patch("shadow_code.ollama_client.requests.post", return_value=mock_resp) as post:
+                list(client.chat_stream([], "system"))
+            return post.call_args.kwargs["json"]
+
+        self.assertEqual(payload_for(True)["think"], True)
+        self.assertNotIn("think", payload_for(False))
 
     def test_chat_stream_normalizes_malformed_calls_without_executing(self):
         import json

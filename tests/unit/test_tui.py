@@ -122,6 +122,52 @@ class TestTranscriptModel(unittest.TestCase):
         self.assertEqual(model.render(_ASCII), "> a\n  b")
 
 
+class TestTranscriptModelThinking(unittest.TestCase):
+    """SHADOW_THINK: thinking rows are dim, sanitized, and collapsible."""
+
+    def test_thinking_delta_accumulates_sanitized_into_one_row(self):
+        model = TranscriptModel()
+        model.append_thinking_delta("pon\x1b[31mder")
+        model.append_thinking_delta("ing")
+        self.assertEqual(len(model.entries), 1)
+        self.assertEqual(model.entries[0].kind, "thinking")
+        self.assertEqual(model.entries[0].text, "pondering")
+
+    def test_thinking_row_is_separate_from_assistant_row(self):
+        model = TranscriptModel()
+        model.append_thinking_delta("reasoning")
+        model.append_assistant_delta("answer")
+        self.assertEqual([entry.kind for entry in model.entries], ["thinking", "assistant"])
+        self.assertEqual(model.entries[1].text, "answer")
+
+    def test_collapse_thinking_replaces_body_with_summary(self):
+        model = TranscriptModel()
+        model.append_thinking_delta("long hidden reasoning")
+        model.collapse_thinking("* thought for 1.2s (~5 tokens)")
+        self.assertEqual(len(model.entries), 1)
+        self.assertEqual(model.entries[0].text, "* thought for 1.2s (~5 tokens)")
+        self.assertNotIn("hidden", model.render(_ASCII))
+
+    def test_collapse_thinking_without_row_is_noop(self):
+        model = TranscriptModel()
+        model.append_assistant_delta("answer")
+        model.collapse_thinking("* thought for 0.1s")
+        self.assertEqual([entry.kind for entry in model.entries], ["assistant"])
+
+    def test_thinking_renders_dim_fragment_with_colors(self):
+        model = TranscriptModel()
+        model.append_thinking_delta("why")
+        fragments = model.render_fragments(_UNICODE)
+        self.assertIn(("class:thinking", "why"), fragments)
+
+    def test_thinking_no_color_renders_plain(self):
+        model = TranscriptModel()
+        model.append_thinking_delta("why")
+        self.assertEqual(model.render(_ASCII), "why")
+        fragments = model.render_fragments(_ASCII)
+        self.assertEqual(fragments, [("", "why")])
+
+
 class TestFooterModel(unittest.TestCase):
     def _model(self, **overrides) -> FooterModel:
         base = {

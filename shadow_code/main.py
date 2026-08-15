@@ -35,6 +35,7 @@ from .config import (
     MAX_TOOL_TURNS,
     MODEL_NAME,
     MUTATION_STRICT,
+    THINK_ENABLED,
     TUI_ENABLED,
 )
 from .context_compaction import (
@@ -1285,6 +1286,17 @@ def _run_line_loop(rt: SessionRuntime) -> None:
         else:
             rt.display.reset()
             cancelled = False
+            thinking_seen = False
+
+            def mark_thinking(_text: str) -> None:
+                # Plain fallback: one static marker per round, body hidden.
+                nonlocal thinking_seen
+                if not thinking_seen:
+                    thinking_seen = True
+                    print("[thinking...]")
+
+            if THINK_ENABLED:
+                client.thinking_handler = mark_thinking
             try:
                 for chunk in client.chat_stream(
                     conv.get_messages(), rt.system_prompt, tools=rt.tool_schemas
@@ -1297,6 +1309,9 @@ def _run_line_loop(rt: SessionRuntime) -> None:
                 cancelled = True
             except Exception as error:
                 raise StreamError("provider_error", str(error)) from error
+            finally:
+                if THINK_ENABLED:
+                    client.thinking_handler = None
             rt.display.flush()
             print()
             if cancelled:

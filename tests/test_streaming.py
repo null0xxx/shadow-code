@@ -199,5 +199,130 @@ class TestStreamControllerRich(unittest.TestCase):
         self.assertEqual(ctrl.display.get_full_response(), "visible")
 
 
+class TestStreamControllerThinking(unittest.TestCase):
+    """SHADOW_THINK: display-only thinking channel in both stream paths."""
+
+    class FakeThinkingClient:
+        """Scripted client whose stream emits thinking via the handler."""
+
+        def __init__(self):
+            self.thinking_handler = None
+            self.last_prompt_tokens = 5
+            self.last_eval_tokens = 11
+
+        def chat_stream(self, messages, system, model=None, tools=None):
+            handler = self.thinking_handler
+            if handler is not None:
+                handler("let me think")
+                handler(" about it")
+            yield "real answer"
+
+    def test_rich_thinking_renders_live_and_collapses_to_summary(self):
+        live = MagicMock()
+        live.__enter__.return_value = live
+        live.__exit__.return_value = False
+        client = self.FakeThinkingClient()
+        ui = MagicMock()
+        ui.render_thinking.return_value = "spinner"
+        ui.render_streaming_with_tokens.side_effect = lambda text, tokens, thinking="": (
+            text,
+            tokens,
+            thinking,
+        )
+        ui.render_thought_summary.side_effect = lambda seconds, tokens: ("summary", seconds, tokens)
+        ui.render_response.side_effect = lambda text, tokens: (text, tokens)
+        console = MagicMock()
+        ctrl = StreamController(client, ui, console=console)
+
+        with (
+            patch("shadow_code.streaming.THINK_ENABLED", True),
+            patch("shadow_code.streaming.Live", return_value=live),
+        ):
+            response, tokens = ctrl._stream_rich([], "system")
+
+        # Thinking never joins the response text or the display buffer.
+        self.assertEqual(response, "real answer")
+        self.assertEqual(tokens, 11)
+        self.assertEqual(ctrl.display.get_full_response(), "real answer")
+        # The Live view saw the thinking channel above the (empty) answer.
+        ui.render_streaming_with_tokens.assert_any_call("", 0, thinking="let me think")
+        ui.render_streaming_with_tokens.assert_any_call("", 0, thinking="let me think about it")
+        # Final render: collapsed summary line first, then the response body.
+        self.assertEqual(console.print.call_count, 2)
+        self.assertEqual(console.print.call_args_list[0].args[0][0], "summary")
+        ui.render_response.assert_called_once_with("real answer", 11)
+        # The handler is uninstalled after the stream.
+        self.assertIsNone(client.thinking_handler)
+
+    def test_rich_off_by_default_never_touches_handler(self):
+        live = MagicMock()
+        live.__enter__.return_value = live
+        live.__exit__.return_value = False
+        client = self.FakeThinkingClient()
+        ui = MagicMock()
+        ui.render_streaming_with_tokens.side_effect = lambda text, tokens: (text, tokens)
+        ui.render_response.side_effect = lambda text, tokens: (text, tokens)
+        ctrl = StreamController(client, ui, console=MagicMock())
+
+        with patch("shadow_code.streaming.Live", return_value=live):
+            response, _ = ctrl._stream_rich([], "system")
+
+        self.assertEqual(response, "real answer")
+        self.assertIsNone(client.thinking_handler)  # untouched: still the initial None
+        # No summary line without thinking.
+        ui.render_thought_summary.assert_not_called()
+
+    def test_plain_thinking_prints_single_marker_and_hides_body(self):
+        client = self.FakeThinkingClient()
+        ctrl = StreamController(client, MagicMock())
+        captured = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = captured
+            with patch("shadow_code.streaming.THINK_ENABLED", True):
+                resp, tokens = ctrl._stream_plain([], "system")
+        finally:
+            sys.stdout = old
+
+        self.assertEqual(resp, "real answer")
+        self.assertEqual(tokens, 11)
+        self.assertEqual(captured.getvalue().count("[thinking...]"), 1)
+        self.assertNotIn("let me think", captured.getvalue())
+        self.assertNotIn("\x1b", captured.getvalue())
+        self.assertIsNone(client.thinking_handler)
+
+    def test_flag_on_vs_off_store_byte_identical_conversation(self):
+        from shadow_code.conversation import Conversation
+
+        def run(enabled: bool):
+            client = self.FakeThinkingClient()
+            ui = MagicMock()
+            ui.render_streaming_with_tokens.side_effect = lambda text, tokens, thinking="": (
+                text,
+                tokens,
+                thinking,
+            )
+            ui.render_response.side_effect = lambda text, tokens: (text, tokens)
+            live = MagicMock()
+            live.__enter__.return_value = live
+            live.__exit__.return_value = False
+            ctrl = StreamController(client, ui, console=MagicMock())
+            with (
+                patch("shadow_code.streaming.THINK_ENABLED", enabled),
+                patch("shadow_code.streaming.Live", return_value=live),
+            ):
+                resp, _ = ctrl._stream_rich([], "system")
+            conv = Conversation()
+            conv.add_user("hi")
+            conv.add_assistant(resp)
+            return resp, conv.get_messages()
+
+        resp_on, messages_on = run(True)
+        resp_off, messages_off = run(False)
+        self.assertEqual(resp_on, resp_off)
+        self.assertEqual(messages_on, messages_off)
+        self.assertNotIn("think", resp_on)
+
+
 if __name__ == "__main__":
     unittest.main()

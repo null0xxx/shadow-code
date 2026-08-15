@@ -79,12 +79,37 @@ class UIRenderer:
             return t
         return self._prefix_text(text)
 
-    def render_streaming_with_tokens(self, text: str, estimated_tokens: int) -> "Text":
-        """Render streaming with ⎿ prefix and token estimate."""
+    def render_streaming_with_tokens(
+        self, text: str, estimated_tokens: int, thinking: str = ""
+    ) -> "Text | Group":
+        """Render streaming with ⎿ prefix and token estimate.
+
+        With ``thinking`` (SHADOW_THINK) the reasoning channel renders dim
+        and italic ABOVE the answer, clearly separated from response text;
+        it is sanitized at render time and never stored.
+        """
         result = self.render_streaming(text)
         if isinstance(result, Text):
             result.append(f"\n{'':>50}~{estimated_tokens:,} tokens", style="dim")
-        return result
+        if not thinking:
+            return result
+        head = Text()
+        head.append(f" {_s.thinking} ", style=f"bold {_t.thinking}")
+        head.append(sanitize_terminal_text(thinking), style="dim italic")
+        return Group(head, result)
+
+    def render_thought_summary(self, seconds: float, tokens: int = 0) -> "Text":
+        """Collapsed one-line summary of the display-only thinking channel.
+
+        This is all that persists into the final render; the thinking body
+        itself never leaves the streaming view.
+        """
+        text = Text()
+        text.append(f" {_s.thinking} ", style=f"bold {_t.thinking}")
+        text.append(f"thought for {seconds:.1f}s", style="dim")
+        if tokens:
+            text.append(f" ({tokens:,} tokens)", style="dim")
+        return text
 
     # --- Response ---
 
