@@ -28,6 +28,18 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ThinkingDelta:
+    """Display-only reasoning text (Ollama ``think: true``).
+
+    A separate channel: it never feeds tool-call assembly, never joins the
+    stored assistant text, and is never persisted or replayed. UI layers may
+    render it dimmed; every other consumer ignores it.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class ToolCallStarted:
     index: int
     call_id: str
@@ -73,6 +85,7 @@ class ProviderError:
 
 ProviderEvent: TypeAlias = (
     TextDelta
+    | ThinkingDelta
     | ToolCallStarted
     | ToolCallArgumentsDelta
     | ToolCallComplete
@@ -177,6 +190,11 @@ class StreamAssembler:
         events: list[ProviderEvent] = []
         message = chunk.get("message")
         message = message if isinstance(message, Mapping) else {}
+
+        thinking = message.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            # Reasoning channel: emitted alongside content, assembled nowhere.
+            events.append(ThinkingDelta(thinking))
 
         content = message.get("content")
         if isinstance(content, str) and content:
@@ -315,11 +333,13 @@ class OllamaProvider:
         options: Mapping[str, Any] | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 600.0,
+        think: bool = False,
     ):
         self._base_url = base_url.rstrip("/")
         self._options = dict(options or {})
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        self._think = think
 
     async def stream(
         self,
@@ -334,6 +354,11 @@ class OllamaProvider:
             "stream": True,
             "options": self._options,
         }
+        if self._think:
+            # Ollama takes `think` as a top-level chat field (not a model
+            # option); the model answers with a separate message.thinking
+            # channel that StreamAssembler surfaces as ThinkingDelta.
+            payload["think"] = True
         if tools is not None:
             payload["tools"] = tools
 

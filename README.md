@@ -612,6 +612,7 @@ and text responses, but commands that require file or shell tools cannot execute
 | `SHADOW_MUTATION_STRICT` | disabled | Export approved file changes as reviewed patches under `.shadow-code-exports/`, never apply them |
 | `SHADOW_TUI` | disabled | Opt in to the persistent TUI (real TTYs + prompt_toolkit required) |
 | `SHADOW_ASCII` | disabled | Plain-ASCII TUI decoration (`NO_COLOR` forces this too) |
+| `SHADOW_THINK` | disabled | Opt in to the model's reasoning channel (Ollama `think: true`), rendered dimmed and display-only; requires a model with thinking support |
 | `SHADOW_REDACT` | empty | Comma-separated extra values redacted from `/doctor`, `/backup`, and `/restore` output |
 
 ## Architecture

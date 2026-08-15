@@ -34,12 +34,14 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import THINK_ENABLED
 from .engine import CallEvent, ProviderRound, StreamCancelledError, StreamError
 from .events import EventStore
 from .main import (
@@ -101,6 +103,7 @@ _KIND_ASSISTANT = "assistant"
 _KIND_TOOL = "tool"
 _KIND_TOOL_GROUP = "tool_group"
 _KIND_SYSTEM = "system"
+_KIND_THINKING = "thinking"
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,27 @@ class TranscriptModel:
             self._entries[-1] = TranscriptEntry(_KIND_ASSISTANT, last.text + delta)
         else:
             self._entries.append(TranscriptEntry(_KIND_ASSISTANT, delta))
+
+    def append_thinking_delta(self, delta: str) -> None:
+        """Accumulate display-only reasoning (SHADOW_THINK) as a dim row.
+
+        The row lives only in this view model -- never in conversation
+        history or event payloads -- and collapses to a one-line summary
+        when the round completes.
+        """
+        delta = sanitize_terminal_text(delta)
+        if not delta:
+            return
+        if self._entries and self._entries[-1].kind == _KIND_THINKING:
+            last = self._entries[-1]
+            self._entries[-1] = TranscriptEntry(_KIND_THINKING, last.text + delta)
+        else:
+            self._entries.append(TranscriptEntry(_KIND_THINKING, delta))
+
+    def collapse_thinking(self, summary: str) -> None:
+        """Replace the trailing live thinking row with its one-line summary."""
+        if self._entries and self._entries[-1].kind == _KIND_THINKING:
+            self._entries[-1] = TranscriptEntry(_KIND_THINKING, sanitize_terminal_text(summary))
 
     def append_tool_line(self, tool_name: str, status: str) -> None:
         line = f"[{sanitize_terminal_text(tool_name)}] {sanitize_terminal_text(status)}"
@@ -225,6 +249,10 @@ class TranscriptModel:
                 continue
             if entry.kind == _KIND_ASSISTANT:
                 fragments.extend(render_markdown_lite(entry.text, theme))
+                continue
+            if entry.kind == _KIND_THINKING:
+                text = "\n".join(self._render_entry(entry, theme, width))
+                fragments.append(("class:thinking", text))
                 continue
             fragments.append(("", "\n".join(self._render_entry(entry, theme, width))))
         return fragments
@@ -465,6 +493,7 @@ class TuiApp:
             "frame.label": "bold #d77757",
             "text-area": "#e0e0e0",
             "footer": "bg:#1a1a1a #888888",
+            "thinking": "italic #888888",
         }
         styles.update(THEME_TOKENS)
         return PTStyle.from_dict(styles)
@@ -656,6 +685,17 @@ class TuiApp:
     def post_delta(self, delta: str) -> None:
         self.post(lambda: self.model.append_assistant_delta(delta))
 
+    def post_thinking(self, delta: str) -> None:
+        self.post(lambda: self.model.append_thinking_delta(delta))
+
+    def post_thinking_done(self, seconds: float, tokens: int = 0) -> None:
+        """Collapse the live thinking row to its summary line."""
+        symbol = "*" if self.theme.ascii_mode else "⏺"
+        line = f"{symbol} thought for {seconds:.1f}s"
+        if tokens:
+            line += f" (~{tokens} tokens)"
+        self.post(lambda: self.model.collapse_thinking(line))
+
     # -- approval bridge --------------------------------------------------
 
     def _begin_approval(self, *, plan: Any = None, freeform: Iterable[str] = ()) -> None:
@@ -756,6 +796,21 @@ class TuiApp:
         client = rt.client
         chunks: list[str] = []
         cancelled = False
+        thinking_started: float | None = None
+        thinking_chars = 0
+
+        if THINK_ENABLED:
+            # Display-only reasoning channel: post deltas into the transcript
+            # view model; they never join chunks, so ProviderRound.text and
+            # conversation history stay byte-identical to thinking-off runs.
+            def on_thinking(text: str) -> None:
+                nonlocal thinking_started, thinking_chars
+                if thinking_started is None:
+                    thinking_started = time.monotonic()
+                thinking_chars += len(text)
+                self.post_thinking(text)
+
+            client.thinking_handler = on_thinking
         try:
             for chunk in client.chat_stream(
                 rt.conv.get_messages(), rt.system_prompt, tools=rt.tool_schemas
@@ -769,8 +824,13 @@ class TuiApp:
             raise
         except Exception as error:
             raise StreamError("provider_error", str(error)) from error
+        finally:
+            if THINK_ENABLED:
+                client.thinking_handler = None
         if cancelled:
             raise StreamCancelledError
+        if thinking_started is not None:
+            self.post_thinking_done(time.monotonic() - thinking_started, thinking_chars // 4)
         rt.conv.update_tokens(client.last_prompt_tokens)
         if rt.state is not None:
             rt.state.tokens_used = rt.conv.total_prompt_tokens

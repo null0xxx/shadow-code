@@ -6,18 +6,19 @@
 # that preserves the historical chat_stream/last_tool_calls surface.
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
 import requests
 
-from .config import MODEL_NAME, MODEL_OPTIONS, OLLAMA_BASE_URL
+from .config import MODEL_NAME, MODEL_OPTIONS, OLLAMA_BASE_URL, THINK_ENABLED
 from .provider import (
     OllamaProvider,
     ProviderError,
     ProviderStreamError,
     TextDelta,
+    ThinkingDelta,
     ToolCallComplete,
     UsageUpdate,
     iter_events_sync,
@@ -255,7 +256,11 @@ class OllamaClient:
         self.last_prompt_tokens: int = 0
         self.last_eval_tokens: int = 0
         self.last_tool_calls: list[dict] = []
-        self._provider = OllamaProvider(OLLAMA_BASE_URL, MODEL_OPTIONS)
+        # Display-only sink for ThinkingDelta events (SHADOW_THINK). The
+        # streaming frontends install a handler for the duration of one
+        # stream; None means thinking text is dropped silently.
+        self.thinking_handler: Callable[[str], None] | None = None
+        self._provider = OllamaProvider(OLLAMA_BASE_URL, MODEL_OPTIONS, think=THINK_ENABLED)
 
     def health_check(self) -> tuple[bool, str]:
         """Verify Ollama is running and model is available."""
@@ -296,6 +301,11 @@ class OllamaClient:
         for event in iter_events_sync(events):
             if isinstance(event, TextDelta):
                 yield event.text
+            elif isinstance(event, ThinkingDelta):
+                # Display-only: routed to the installed handler, never yielded
+                # as text and never recorded on the client.
+                if self.thinking_handler is not None:
+                    self.thinking_handler(event.text)
             elif isinstance(event, ToolCallComplete):
                 arguments = event.arguments
                 self.last_tool_calls.append(

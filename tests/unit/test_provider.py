@@ -18,6 +18,7 @@ from shadow_code.provider import (
     ProviderStreamError,
     StreamAssembler,
     TextDelta,
+    ThinkingDelta,
     ToolCallArgumentsDelta,
     ToolCallComplete,
     ToolCallStarted,
@@ -397,6 +398,98 @@ class TestChatStreamAdapterParity(unittest.TestCase):
             with self.assertRaises(ProviderStreamError) as ctx:
                 list(stream)
         self.assertEqual(ctx.exception.code, "malformed_payload")
+
+
+class TestThinkingChannel(unittest.TestCase):
+    """SHADOW_THINK: ThinkingDelta is a display-only side channel."""
+
+    def test_thinking_field_parses_into_thinking_delta(self):
+        assembler = StreamAssembler()
+        events = assembler.feed(
+            {"message": {"thinking": "pondering ", "content": "answer"}, "done": False}
+        )
+        self.assertEqual(events, [ThinkingDelta("pondering "), TextDelta("answer")])
+
+    def test_chunk_without_thinking_field_emits_no_thinking_events(self):
+        assembler = StreamAssembler()
+        events = assembler.feed({"message": {"content": "hi"}, "done": True})
+        self.assertEqual(events_of(events, ThinkingDelta), [])
+        self.assertEqual(events_of(events, TextDelta), [TextDelta("hi")])
+
+    def test_thinking_never_enters_tool_arguments(self):
+        assembler = StreamAssembler()
+        events = assembler.feed(
+            {
+                "message": {
+                    "thinking": "I should read a.txt",
+                    "tool_calls": [
+                        {"function": {"name": "read_file", "arguments": {"file_path": "a.txt"}}}
+                    ],
+                },
+                "done": True,
+            }
+        )
+        completes = events_of(events, ToolCallComplete)
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(dict(completes[0].arguments), {"file_path": "a.txt"})
+        self.assertEqual(events_of(events, ThinkingDelta), [ThinkingDelta("I should read a.txt")])
+
+    def test_collect_turn_excludes_thinking_from_text_and_tokens(self):
+        async def replay():
+            yield ThinkingDelta("hidden reasoning")
+            yield TextDelta("visible")
+            yield UsageUpdate(prompt_tokens=10, eval_tokens=7)
+            yield TurnDone("stop")
+
+        turn = asyncio.run(collect_turn(replay()))
+        self.assertEqual(turn.text, "visible")
+        self.assertEqual((turn.prompt_tokens, turn.eval_tokens), (10, 7))
+
+    def test_think_true_sent_only_when_enabled(self):
+        def payload_for(think: bool):
+            provider = OllamaProvider("http://fixture.invalid", {}, think=think)
+            with patch("shadow_code.provider.requests.post", return_value=FakeResponse([])) as post:
+
+                async def drain():
+                    return [event async for event in provider.stream([], "system")]
+
+                asyncio.run(drain())
+            return post.call_args.kwargs["json"]
+
+        self.assertEqual(payload_for(True)["think"], True)
+        self.assertNotIn("think", payload_for(False))
+
+    def test_thinking_stream_keeps_text_and_calls_intact(self):
+        lines = [
+            json.dumps({"message": {"thinking": "hmm"}, "done": False}).encode(),
+            json.dumps(
+                {
+                    "message": {
+                        "thinking": "...",
+                        "tool_calls": [
+                            {"function": {"name": "glob", "arguments": {"pattern": "*.py"}}}
+                        ],
+                    },
+                    "done": False,
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "message": {"content": "done"},
+                    "done": True,
+                    "prompt_eval_count": 5,
+                    "eval_count": 9,
+                }
+            ).encode(),
+        ]
+        events, _ = run_provider(lines)
+        self.assertEqual(
+            events_of(events, ThinkingDelta), [ThinkingDelta("hmm"), ThinkingDelta("...")]
+        )
+        self.assertEqual(events_of(events, TextDelta), [TextDelta("done")])
+        completes = events_of(events, ToolCallComplete)
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(dict(completes[0].arguments), {"pattern": "*.py"})
 
 
 if __name__ == "__main__":

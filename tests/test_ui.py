@@ -68,6 +68,49 @@ class TestUIRenderer(unittest.TestCase):
         self.assertEqual(len(renderables), 1)
         self.assertIsInstance(renderables[0], Markdown)
 
+    def test_render_streaming_with_thinking_separates_and_sanitizes(self):
+        from rich.console import Group
+
+        result = self.ui.render_streaming_with_tokens(
+            "answer", 3, thinking="plotting \x1b[31mevil\x07"
+        )
+        self.assertIsInstance(result, Group)
+        out = _render_to_str(result, force_terminal=True)
+        # The model's own control sequences never reach the terminal...
+        self.assertNotIn("\x1b[31m", out)
+        self.assertNotIn("\x07", out)
+        # ...while the thinking text renders above the answer.
+        self.assertLess(out.index("plotting evil"), out.index("answer"))
+
+    def test_render_streaming_without_thinking_unchanged(self):
+        from rich.text import Text
+
+        result = self.ui.render_streaming_with_tokens("answer", 3)
+        self.assertIsInstance(result, Text)
+
+    def test_render_thought_summary_line(self):
+        out = _render_to_str(self.ui.render_thought_summary(1.234, 517))
+        self.assertIn("thought for 1.2s", out)
+        self.assertIn("517", out)
+        out_no_tokens = _render_to_str(self.ui.render_thought_summary(0.5))
+        self.assertIn("thought for 0.5s", out_no_tokens)
+        self.assertNotIn("tokens", out_no_tokens)
+
+    def test_render_thought_summary_no_ansi_on_dumb_terminal(self):
+        import os
+        from unittest.mock import patch
+
+        from rich.console import Console
+
+        # Pin TERM=dumb so the zero-ANSI assertion is runner-independent
+        # (same gotcha as test_render_response_no_color_env_emits_no_ansi).
+        with patch.dict(os.environ, {"NO_COLOR": "1", "TERM": "dumb"}):
+            buf = io.StringIO()
+            console = Console(file=buf, force_terminal=True, width=100)
+            console.print(self.ui.render_thought_summary(2.0, 12))
+        self.assertNotIn("\x1b", buf.getvalue())
+        self.assertIn("thought for 2.0s", buf.getvalue())
+
     def test_render_response_fenced_code_block_survives(self):
         md = "Here is the code:\n\n```python\ndef hello():\n    return 1\n```\n"
         out = _render_to_str(self.ui.render_response(md))

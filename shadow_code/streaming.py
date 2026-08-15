@@ -6,7 +6,9 @@
 
 import io
 import sys
+import time
 
+from .config import THINK_ENABLED
 from .display import StreamDisplay
 
 
@@ -53,6 +55,8 @@ class StreamController:
         self.display.reset()
         accumulated_visible = ""
         char_count = 0
+        thinking_parts: list[str] = []
+        thinking_started: float | None = None
 
         try:
             with Live(
@@ -61,17 +65,38 @@ class StreamController:
                 refresh_per_second=10,
                 transient=True,
             ) as live:
-                for chunk in self.client.chat_stream(messages, system, tools=tools):
-                    visible_text = self._feed_and_capture(chunk)
-                    char_count += len(chunk)
-                    if visible_text:
-                        accumulated_visible += visible_text
-                        estimated_tokens = char_count // 4
+                if THINK_ENABLED:
+                    # Thinking deltas arrive synchronously from chat_stream on
+                    # this thread; render them dim above the answer, live.
+                    def _capture_thinking(text: str) -> None:
+                        nonlocal thinking_started
+                        if thinking_started is None:
+                            thinking_started = time.monotonic()
+                        thinking_parts.append(text)
                         live.update(
                             self.ui.render_streaming_with_tokens(
-                                accumulated_visible, estimated_tokens
+                                accumulated_visible,
+                                char_count // 4,
+                                thinking="".join(thinking_parts),
                             )
                         )
+
+                    self.client.thinking_handler = _capture_thinking
+                try:
+                    for chunk in self.client.chat_stream(messages, system, tools=tools):
+                        visible_text = self._feed_and_capture(chunk)
+                        char_count += len(chunk)
+                        if visible_text:
+                            accumulated_visible += visible_text
+                            estimated_tokens = char_count // 4
+                            live.update(
+                                self.ui.render_streaming_with_tokens(
+                                    accumulated_visible, estimated_tokens
+                                )
+                            )
+                finally:
+                    if THINK_ENABLED:
+                        self.client.thinking_handler = None
 
                 remaining = self._flush_and_capture()
                 if remaining:
@@ -84,6 +109,12 @@ class StreamController:
             raise StreamCancelled() from None
 
         # Print final response OUTSIDE Live (stays on screen permanently)
+        if thinking_parts:
+            # The thinking body stays ephemeral: only a collapsed one-line
+            # summary persists above the final response block.
+            elapsed = time.monotonic() - (thinking_started or time.monotonic())
+            thinking_tokens = sum(len(part) for part in thinking_parts) // 4
+            self.console.print(self.ui.render_thought_summary(elapsed, thinking_tokens))
         if accumulated_visible.strip():
             tokens = self.client.last_eval_tokens
             self.console.print(self.ui.render_response(accumulated_visible, tokens))
@@ -98,6 +129,17 @@ class StreamController:
     ) -> tuple[str, int]:
         """Fallback: plain stdout streaming."""
         self.display.reset()
+        thinking_seen = False
+
+        def _mark_thinking(_text: str) -> None:
+            # Plain path: a single static marker, never raw ANSI, body hidden.
+            nonlocal thinking_seen
+            if not thinking_seen:
+                thinking_seen = True
+                print("[thinking...]")
+
+        if THINK_ENABLED:
+            self.client.thinking_handler = _mark_thinking
 
         try:
             for chunk in self.client.chat_stream(messages, system, tools=tools):
@@ -106,6 +148,9 @@ class StreamController:
             self.display.flush()
             print()
             raise StreamCancelled() from None
+        finally:
+            if THINK_ENABLED:
+                self.client.thinking_handler = None
 
         self.display.flush()
         print()
