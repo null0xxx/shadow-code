@@ -22,6 +22,7 @@ from typing import Any
 from wcwidth import wcswidth, wcwidth
 
 from .terminal_text import sanitize_terminal_text
+from .theme import THEME
 
 # -- theme tokens -------------------------------------------------------------
 
@@ -40,6 +41,9 @@ THEME_TOKENS: dict[str, str] = {
     "md-bold": "bold",
     "md-code": "ansimagenta",
     "approval-frame": "#d77757",
+    "assistant-marker": f"bold {THEME.accent}",
+    "tips-accent": f"bold {THEME.accent}",
+    "user-box": THEME.text_muted,
 }
 
 

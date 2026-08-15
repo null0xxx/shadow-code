@@ -37,15 +37,42 @@ class UIRenderer:
 
     # --- Welcome ---
 
-    def render_welcome(self) -> "Panel":
-        content = Text()
-        content.append(f"\n  {_s.diamond_filled} ", style=f"bold {_t.brand}")
-        content.append("shadow", style=f"bold {_t.brand}")
-        content.append("-code", style=f"{_t.text_dim}")
-        content.append("  v0.1.0\n", style="dim")
-        content.append(f"  {MODEL_NAME}\n", style="dim")
-        content.append("  /help for commands\n", style="dim italic")
-        return Panel(content, border_style=_t.text_muted, box=ROUNDED, padding=(0, 0))
+    def render_welcome(self, width: int | None = None) -> "Group":
+        """Startup banner: gradient wordmark, tagline, and tips block.
+
+        The gradient styles are color-only (no bold/dim), so a NO_COLOR or
+        dumb-terminal console strips them entirely and the plain ASCII art
+        remains. Terminals narrower than the art get a one-line title.
+        """
+        from . import banner
+
+        art = Text()
+        for line_index, line in enumerate(banner.banner_lines(width)):
+            if line_index:
+                art.append("\n")
+            for column, char in enumerate(line):
+                if char == " ":
+                    art.append(char)
+                else:
+                    art.append(char, style=banner.column_color(column))
+
+        tagline = Text()
+        tagline.append(f"  {banner.TAGLINE}\n", style=f"{_t.text_dim}")
+        tagline.append(f"  v0.1.0  {_s.dot}  {MODEL_NAME}", style=f"dim {_t.text_dim}")
+
+        tips = Text()
+        for line_index, line in enumerate(banner.tips_lines()):
+            if line_index:
+                tips.append("\n")
+            if "/help" in line:
+                before, _, after = line.partition("/help")
+                tips.append(before, style=f"{_t.text_dim}")
+                tips.append("/help", style=f"bold {_t.accent}")
+                tips.append(after, style=f"{_t.text_dim}")
+            else:
+                tips.append(line, style=f"{_t.text_dim}")
+
+        return Group(art, tagline, tips)
 
     # --- Thinking / Streaming ---
 
@@ -168,14 +195,16 @@ class UIRenderer:
 
         The text is sanitized BEFORE Markdown construction so injected
         terminal control sequences can never reach the console (storage
-        keeps the raw bytes; sanitization is render-time only). The token
+        keeps the raw bytes; sanitization is render-time only). A small
+        accent marker (⏺, ASCII fallback "*") leads the response; the token
         count is a plain Text sibling below the Markdown body.
         """
+        marker = Text(f" {_s.thinking} ", style=f"bold {_t.accent}")
         body = Markdown(self._normalize_loose_markdown(sanitize_terminal_text(text)))
         if tokens:
             token_line = Text(f"{'':>50}{tokens:,} tokens", style="dim")
-            return Group(body, token_line)
-        return Group(body)
+            return Group(marker, body, token_line)
+        return Group(marker, body)
 
     # --- Tool Calls (Claude Code style: ⎿ prefix) ---
 

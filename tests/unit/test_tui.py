@@ -27,6 +27,7 @@ from shadow_code.tui import (
     TranscriptModel,
     TuiApp,
     TuiTheme,
+    git_branch,
     render_footer,
     sanitize_terminal_text,
     width_bucket,
@@ -105,21 +106,56 @@ class TestTranscriptModel(unittest.TestCase):
         model.clear()
         self.assertEqual(model.entries, ())
 
-    def test_render_unicode_user_prefix(self):
+    def test_render_unicode_user_boxed(self):
         model = TranscriptModel()
         model.append_user("hello")
         model.append_assistant_delta("world")
-        self.assertEqual(model.render(_UNICODE), "› hello\nworld")
+        self.assertEqual(
+            model.render(_UNICODE),
+            "╭─────────╮\n│ > hello │\n╰─────────╯\n⏺ world",
+        )
 
-    def test_render_ascii_user_prefix(self):
+    def test_render_ascii_user_boxed(self):
         model = TranscriptModel()
         model.append_user("hello")
-        self.assertEqual(model.render(_ASCII), "> hello")
+        self.assertEqual(model.render(_ASCII), "+---------+\n| > hello |\n+---------+")
 
-    def test_render_multiline_indents_continuation(self):
+    def test_render_multiline_user_boxed(self):
         model = TranscriptModel()
         model.append_user("a\nb")
-        self.assertEqual(model.render(_ASCII), "> a\n  b")
+        self.assertEqual(model.render(_ASCII), "+-----+\n| > a |\n|   b |\n+-----+")
+
+    def test_user_box_fragments_style_only_the_border(self):
+        model = TranscriptModel()
+        model.append_user("hi")
+        fragments = model.render_fragments(_UNICODE, 80)
+        border_styles = [text for style, text in fragments if style == "class:user-box"]
+        self.assertTrue(any("╭" in text for text in border_styles))
+        self.assertTrue(any("╯" in text for text in border_styles))
+        # The user's own words stay unstyled inside the box.
+        self.assertIn(("", "> hi"), fragments)
+
+    def test_user_box_no_color_is_plain(self):
+        model = TranscriptModel()
+        model.append_user("hi")
+        self.assertEqual(
+            model.render_fragments(_ASCII, 80),
+            [("", "+------+\n| > hi |\n+------+")],
+        )
+
+    def test_assistant_marker_fragments(self):
+        model = TranscriptModel()
+        model.append_assistant_delta("answer")
+        fragments = model.render_fragments(_UNICODE, 80)
+        self.assertEqual(fragments[0], ("class:assistant-marker", "⏺ "))
+        self.assertIn(("", "answer"), fragments)
+
+    def test_assistant_multiline_continuation_aligned(self):
+        model = TranscriptModel()
+        model.append_assistant_delta("one\ntwo")
+        fragments = model.render_fragments(_UNICODE, 80)
+        plain = "".join(text for _style, text in fragments)
+        self.assertEqual(plain, "⏺ one\n  two")
 
 
 class TestTranscriptModelThinking(unittest.TestCase):
@@ -232,11 +268,52 @@ class TestFooterModel(unittest.TestCase):
         self.assertNotIn("│", lines[0])
         self.assertIn("|", lines[0])
 
+    def test_git_branch_shown_next_to_workspace(self):
+        lines = render_footer(self._model(git_branch="feat/visual-identity"), 120)
+        self.assertIn("/home/user/project (feat/visual-identity)", lines[0])
+        standard = render_footer(self._model(git_branch="main"), 80)
+        self.assertIn("(main)", standard[1])
+        compact = render_footer(self._model(git_branch="main"), 40)
+        self.assertNotIn("(main)", compact[0])  # narrow buckets drop the workspace
+
+    def test_no_branch_by_default(self):
+        joined = "\n".join(render_footer(self._model(), 120))
+        self.assertNotIn("(", joined)
+
     def test_widths_119_79_fall_to_next_bucket(self):
         self.assertEqual(len(render_footer(self._model(), 119)), 2)
         self.assertIn("bash:UNCONFINED", render_footer(self._model(), 119)[0])
         self.assertEqual(len(render_footer(self._model(), 79)), 1)
         self.assertIn("ctx 8%", render_footer(self._model(), 79)[0])
+
+
+class TestGitBranch(unittest.TestCase):
+    def test_branch_from_head_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = Path(tmp) / ".git"
+            git.mkdir()
+            (git / "HEAD").write_text("ref: refs/heads/feat/x\n", encoding="utf-8")
+            self.assertEqual(git_branch(tmp), "feat/x")
+
+    def test_detached_head_shows_short_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = Path(tmp) / ".git"
+            git.mkdir()
+            (git / "HEAD").write_text("9bd80a1" + "0" * 33 + "\n", encoding="utf-8")
+            self.assertEqual(git_branch(tmp), "9bd80a1")
+
+    def test_worktree_gitdir_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_git = Path(tmp) / "real-git"
+            real_git.mkdir()
+            (real_git / "HEAD").write_text("ref: refs/heads/wt\n", encoding="utf-8")
+            (Path(tmp) / ".git").write_text(f"gitdir: {real_git}\n", encoding="utf-8")
+            self.assertEqual(git_branch(tmp), "wt")
+
+    def test_no_repo_no_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(git_branch(tmp), "")
+        self.assertEqual(git_branch("/nonexistent/path"), "")
 
 
 class TestWidthBucket(unittest.TestCase):
@@ -305,6 +382,33 @@ class TestTuiAppLayout(TuiAppCase):
     def test_boot_lines_land_in_transcript(self):
         app = self._app(boot_lines=["[bash runs UNCONFINED]"])
         self.assertIn("[bash runs UNCONFINED]", app.model.render(_ASCII))
+
+    def test_boot_starts_with_banner_and_tips(self):
+        app = self._app(boot_lines=["[authority line]"])
+        rendered = app.model.render(_ASCII)
+        self.assertIn("####", rendered)  # wordmark art
+        self.assertIn("Tips for getting started:", rendered)
+        self.assertIn("/help", rendered)
+        # Order: banner -> tips -> authority boot lines.
+        self.assertLess(rendered.index("####"), rendered.index("Tips for getting started:"))
+        self.assertLess(
+            rendered.index("Tips for getting started:"), rendered.index("[authority line]")
+        )
+
+    def test_boot_banner_gradient_fragments_when_colored(self):
+        theme = TuiTheme(colors=True, ascii_mode=False)
+        app = self._app(theme=theme)
+        fragments = app.model.render_fragments(theme, 80)
+        hex_styles = {style for style, _t in fragments if style.startswith("#")}
+        self.assertGreater(len(hex_styles), 10)  # a real gradient, not one flat color
+        self.assertIn(("class:tips-accent", "/help"), fragments)
+
+    def test_boot_banner_no_color_is_plain(self):
+        app = self._app()  # _ASCII theme: colors off
+        fragments = app.model.render_fragments(_ASCII, 80)
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual(fragments[0][0], "")
+        self.assertIn("####", fragments[0][1])
 
     def test_input_area_has_focus(self):
         app = self._app()

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -41,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import banner as _banner
 from .config import THINK_ENABLED
 from .engine import CallEvent, ProviderRound, StreamCancelledError, StreamError
 from .events import EventStore
@@ -71,6 +73,7 @@ __all__ = [
     "TranscriptModel",
     "TuiApp",
     "TuiTheme",
+    "git_branch",
     "render_footer",
     "run_tui",
     "sanitize_terminal_text",
@@ -104,6 +107,7 @@ _KIND_TOOL = "tool"
 _KIND_TOOL_GROUP = "tool_group"
 _KIND_SYSTEM = "system"
 _KIND_THINKING = "thinking"
+_KIND_BANNER = "banner"
 
 
 @dataclass(frozen=True)
@@ -121,11 +125,67 @@ class TranscriptEntry:
 
 
 def _prefix(kind: str, theme: TuiTheme) -> str:
-    if kind == _KIND_USER:
-        return "> " if theme.ascii_mode else "› "
+    if kind == _KIND_ASSISTANT:
+        return "* " if theme.ascii_mode else "⏺ "
     if kind == _KIND_TOOL:
         return "  "
     return ""
+
+
+# Submitted user messages render inside a subtle bordered container with a
+# "> " marker (easy-llm-cli style); box drawing collapses to ASCII +-| in
+# ASCII/NO_COLOR mode while the marker and text survive unchanged.
+_USER_MARKER = "> "
+
+
+def _boxed_lines(text: str, theme: TuiTheme, width: int) -> list[str]:
+    """Wrap ``text`` in a one-cell border; long lines wrap inside the box."""
+    if theme.ascii_mode:
+        top_left, top_right, bot_left, bot_right, horiz, vert = "+", "+", "+", "+", "-", "|"
+    else:
+        top_left, top_right, bot_left, bot_right, horiz, vert = "╭", "╮", "╰", "╯", "─", "│"
+    inner = max(8, width - 4)  # the two border columns plus one space each side
+    contents: list[str] = []
+    for line_index, raw in enumerate(text.split("\n")):
+        prefix = _USER_MARKER if line_index == 0 else " " * len(_USER_MARKER)
+        segments = textwrap.wrap(raw, max(1, inner - len(_USER_MARKER))) or [""]
+        for segment_index, segment in enumerate(segments):
+            contents.append((prefix if segment_index == 0 else " " * len(_USER_MARKER)) + segment)
+    box_width = max(len(content) for content in contents)
+    lines = [f"{top_left}{horiz * (box_width + 2)}{top_right}"]
+    lines.extend(f"{vert} {content.ljust(box_width)} {vert}" for content in contents)
+    lines.append(f"{bot_left}{horiz * (box_width + 2)}{bot_right}")
+    return lines
+
+
+def _boxed_fragments(text: str, theme: TuiTheme, width: int) -> list[tuple[str, str]]:
+    """Styled variant of _boxed_lines: only the border carries a style."""
+    lines = _boxed_lines(text, theme, width)
+    if not theme.colors:
+        return [("", "\n".join(lines))]
+    vert = "|" if theme.ascii_mode else "│"
+    fragments: list[tuple[str, str]] = []
+    for index, line in enumerate(lines):
+        if index:
+            fragments.append(("", "\n"))
+        if index == 0 or index == len(lines) - 1:
+            fragments.append(("class:user-box", line))
+        else:
+            fragments.append(("class:user-box", f"{vert} "))
+            fragments.append(("", line[2:-2]))
+            fragments.append(("class:user-box", f" {vert}"))
+    return fragments
+
+
+def _assistant_fragments(text: str, theme: TuiTheme) -> list[tuple[str, str]]:
+    """Markdown-lite assistant body led by an accent marker (⏺ / ASCII *)."""
+    marker = "* " if theme.ascii_mode else "⏺ "
+    fragments = [("class:assistant-marker" if theme.colors else "", marker)]
+    for fragment in render_markdown_lite(text, theme):
+        fragments.append(fragment)
+        if fragment[1].endswith("\n"):
+            fragments.append(("", " " * len(marker)))  # align continuation lines
+    return fragments
 
 
 class TranscriptModel:
@@ -186,6 +246,12 @@ class TranscriptModel:
     def append_system_line(self, text: str) -> None:
         self._entries.append(TranscriptEntry(_KIND_SYSTEM, sanitize_terminal_text(text)))
 
+    def append_banner(self, width: int | None = None) -> None:
+        """Startup wordmark + tips; gradient styling happens at render time."""
+        art = "\n".join(_banner.banner_lines(width))
+        tips = "\n".join(_banner.tips_lines())
+        self._entries.append(TranscriptEntry(_KIND_BANNER, f"{art}\n\n{tips}"))
+
     def clear(self) -> None:
         self._entries.clear()
         self.tools = ToolLifecycleModel()
@@ -218,6 +284,10 @@ class TranscriptModel:
     def _render_entry(self, entry: TranscriptEntry, theme: TuiTheme, width: int) -> list[str]:
         if entry.group is not None:
             return render_tool_group(entry.group, theme, width)
+        if entry.kind == _KIND_BANNER:
+            return [*_banner.banner_lines(width), "", *_banner.tips_lines()]
+        if entry.kind == _KIND_USER:
+            return _boxed_lines(entry.text, theme, width)
         prefix = _prefix(entry.kind, theme)
         lines = entry.text.split("\n")
         return [
@@ -247,8 +317,16 @@ class TranscriptModel:
             if entry.group is not None:
                 fragments.extend(render_tool_group_fragments(entry.group, theme, width))
                 continue
+            if entry.kind == _KIND_BANNER:
+                fragments.extend(_banner.styled_banner_fragments(theme.colors, width))
+                fragments.append(("", "\n\n"))
+                fragments.extend(_banner.styled_tips_fragments(theme.colors))
+                continue
+            if entry.kind == _KIND_USER:
+                fragments.extend(_boxed_fragments(entry.text, theme, width))
+                continue
             if entry.kind == _KIND_ASSISTANT:
-                fragments.extend(render_markdown_lite(entry.text, theme))
+                fragments.extend(_assistant_fragments(entry.text, theme))
                 continue
             if entry.kind == _KIND_THINKING:
                 text = "\n".join(self._render_entry(entry, theme, width))
@@ -272,6 +350,7 @@ class FooterModel:
     snapshot_digest: str = ""
     permission_labels: tuple[str, ...] = ()
     state: str = "idle"  # idle | busy | approval
+    git_branch: str = ""
 
     @property
     def context_pct(self) -> float:
@@ -297,6 +376,31 @@ def _shorten(text: str, limit: int) -> str:
     return "..." + text[-(limit - 3) :]
 
 
+def git_branch(workspace_root: str) -> str:
+    """Current git branch for the footer; "" when the root is not a repo.
+
+    No subprocess: .git/HEAD is parsed as a text file (worktree "gitdir:"
+    pointers included), and any absence or oddity degrades to "".
+    """
+    git_dir = Path(workspace_root) / ".git"
+    try:
+        if git_dir.is_file():  # worktree/submodule: "gitdir: <path>"
+            first = git_dir.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            if not first.startswith("gitdir:"):
+                return ""
+            git_dir = Path(first.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = Path(workspace_root) / git_dir
+        head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+    except (OSError, IndexError):
+        return ""
+    if head.startswith("ref: refs/heads/"):
+        return head[len("ref: refs/heads/") :]
+    if head and all(char in "0123456789abcdef" for char in head.lower()):
+        return head[:7]  # detached HEAD: short sha
+    return ""
+
+
 def render_footer(model: FooterModel, width: int, *, ascii_mode: bool = False) -> tuple[str, ...]:
     """Pure layout: one or two footer lines per width bucket.
 
@@ -309,9 +413,12 @@ def render_footer(model: FooterModel, width: int, *, ascii_mode: bool = False) -
     tokens = f"{model.tokens_used // 1000}K/{model.tokens_total // 1000}K"
     perms = " ".join(model.permission_labels)
     digest = f"snap {model.snapshot_digest}" if model.snapshot_digest else ""
+    workspace = model.workspace_root
+    if model.git_branch:
+        workspace = f"{workspace} ({model.git_branch})"
     bucket = width_bucket(width)
     if bucket == "full":
-        head = [model.model_name, tokens, f"ctx {pct:.0f}%", model.workspace_root]
+        head = [model.model_name, tokens, f"ctx {pct:.0f}%", workspace]
         if digest:
             head.append(digest)
         if perms:
@@ -325,7 +432,7 @@ def render_footer(model: FooterModel, width: int, *, ascii_mode: bool = False) -
         if perms:
             head.append(perms)
         head.append(model.state)
-        tail = [_shorten(model.workspace_root, 40)]
+        tail = [_shorten(workspace, 40)]
         if digest:
             tail.append(digest)
         return (f" {sep} ".join(head), f" {sep} ".join(tail))
@@ -386,8 +493,6 @@ class TuiApp:
         self.rt = rt
         self.theme = theme or TuiTheme.from_env()
         self.model = TranscriptModel()
-        for line in boot_lines:
-            self.model.append_system_line(line)
         self._inputs: asyncio.Queue[str | None] = asyncio.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._driver_task: asyncio.Task[None] | None = None
@@ -468,6 +573,12 @@ class TuiApp:
             output=output,
         )
 
+        # Startup identity: gradient wordmark + tips first, then the boot
+        # lines (authority block, prompt snapshot, commands) in order.
+        self.model.append_banner(self._term_width())
+        for line in boot_lines:
+            self.model.append_system_line(line)
+
     # -- layout helpers -------------------------------------------------
 
     def _title(self) -> str:
@@ -544,6 +655,7 @@ class TuiApp:
             snapshot_digest=digest,
             permission_labels=rt.permission_labels,
             state=status,
+            git_branch=git_branch(workspace),
         )
 
     def _footer_text(self) -> str:
